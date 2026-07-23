@@ -795,6 +795,17 @@ Setup data:
 
 
 # ------------------------------------------------------------------------ telegram
+TELEGRAM_CAPTION_LIMIT = 1024   # sendPhoto caption hard limit
+TELEGRAM_MESSAGE_LIMIT = 4096   # sendMessage hard limit
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    # leave room for an ellipsis marker
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
 def send_telegram_alert(setup: TradeSetup, rationale: str, chart_path: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured -- printing alert instead:")
@@ -804,6 +815,10 @@ def send_telegram_alert(setup: TradeSetup, rationale: str, chart_path: str):
     direction_word = "🟢 LONG" if setup.direction == Bias.BULLISH else "🔴 SHORT"
     strategy_label = "Premium/Discount Fade" if setup.strategy == "premium_discount_fade" \
         else "OB/FVG Continuation"
+
+    # Levels-only caption goes on the photo -- keep this short and predictable so it
+    # never risks tripping the 1024-char sendPhoto caption limit, regardless of how
+    # long the AI rationale ends up being.
     caption = (
         f"*{setup.symbol}* — {direction_word} setup ({strategy_label})\n"
         f"HTF {setup.htf_timeframe} bias: {'UP' if setup.htf_trend == Bias.BULLISH else 'DOWN'}  "
@@ -811,21 +826,37 @@ def send_telegram_alert(setup: TradeSetup, rationale: str, chart_path: str):
         f"Entry: `{setup.entry:,.1f}`\n"
         f"Stop: `{setup.stop_loss:,.1f}`\n"
         f"Target: `{setup.take_profit:,.1f}`\n"
-        f"R:R: `{setup.rr}`\n\n"
-        f"_{rationale}_"
+        f"R:R: `{setup.rr}`"
     )
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    caption = _truncate(caption, TELEGRAM_CAPTION_LIMIT)
+
+    photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     with open(chart_path, "rb") as f:
         r = requests.post(
-            url,
+            photo_url,
             data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "Markdown"},
             files={"photo": f},
             timeout=30,
         )
     if not r.ok:
-        log.error(f"Telegram send failed: {r.status_code} {r.text}")
-    else:
-        log.info("Telegram alert sent")
+        log.error(f"Telegram photo send failed: {r.status_code} {r.text}")
+        return
+    log.info("Telegram photo alert sent")
+
+    # Rationale as a separate follow-up message -- 4096-char budget, still truncated
+    # defensively in case Claude ever returns something unusually long.
+    if rationale:
+        message_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        message_text = _truncate(rationale, TELEGRAM_MESSAGE_LIMIT)
+        r2 = requests.post(
+            message_url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message_text},
+            timeout=30,
+        )
+        if not r2.ok:
+            log.error(f"Telegram rationale send failed: {r2.status_code} {r2.text}")
+        else:
+            log.info("Telegram rationale message sent")
 
 
 # ---------------------------------------------------------------------------- core
