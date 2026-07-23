@@ -386,6 +386,17 @@ class SMCEngine:
             equilibrium_bottom=(0.5 + half) * bottom + (0.5 - half) * top,
         )
 
+    @staticmethod
+    def classify_zone(price: float, pdz: "PremiumDiscountZones") -> str:
+        """Labels a price as 'premium', 'discount', or 'equilibrium' relative to a
+        given PremiumDiscountZones range. Used to classify HTF and LTF independently
+        so top-down alignment can be checked (e.g. 4h in premium vs 15m in discount)."""
+        if price >= pdz.premium_bottom:
+            return "premium"
+        if price <= pdz.discount_top:
+            return "discount"
+        return "equilibrium"
+
     # --------------------------------------------------------------- helpers
     @staticmethod
     def active_order_blocks(state: SMCState, internal=False):
@@ -608,13 +619,33 @@ def find_setup(symbol: str,
                ltf_df: pd.DataFrame, ltf_state: SMCState, ltf_tf: str,
                engine: SMCEngine) -> Optional[TradeSetup]:
     """Tries the premium/discount fade first (the primary documented strategy);
-    falls back to OB/FVG continuation if no fade setup is active."""
+    falls back to OB/FVG continuation if no fade setup is active.
+
+    Top-down gate: whichever strategy fires, the resulting direction must agree
+    with the HTF zone. If the 4h range currently reads premium, only SHORT setups
+    are allowed to pass (longs -- including ones sourced from a 15m discount OB/FVG
+    in find_continuation_setup -- are vetoed). Symmetrically, HTF discount vetoes
+    shorts. HTF equilibrium imposes no veto either way.
+    """
     setup = find_premium_discount_setup(symbol, htf_df, htf_state, htf_tf,
                                          ltf_df, ltf_state, ltf_tf, engine)
-    if setup:
-        return setup
-    return find_continuation_setup(symbol, htf_df, htf_state, htf_tf,
-                                    ltf_df, ltf_state, ltf_tf, engine)
+    if setup is None:
+        setup = find_continuation_setup(symbol, htf_df, htf_state, htf_tf,
+                                         ltf_df, ltf_state, ltf_tf, engine)
+    if setup is None:
+        return None
+
+    if htf_state.trailing_top is not None and htf_state.trailing_bottom is not None:
+        htf_pdz = engine.premium_discount_zones(htf_state)
+        htf_zone = engine.classify_zone(htf_df["close"].iloc[-1], htf_pdz)
+        if htf_zone == "premium" and setup.direction == Bias.BULLISH:
+            log.info(f"Vetoed LONG setup ({setup.strategy}) -- HTF {htf_tf} is in premium.")
+            return None
+        if htf_zone == "discount" and setup.direction == Bias.BEARISH:
+            log.info(f"Vetoed SHORT setup ({setup.strategy}) -- HTF {htf_tf} is in discount.")
+            return None
+
+    return setup
 
 
 def find_standalone_setup(symbol: str, df: pd.DataFrame, state: SMCState, tf: str,
@@ -796,8 +827,34 @@ def init_db():
             con.execute(f"ALTER TABLE sent_alerts ADD COLUMN {col_def}")
         except sqlite3.OperationalError:
             pass
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS zone_watch (
+            symbol TEXT, timeframe TEXT, zone TEXT, updated_at TEXT,
+            PRIMARY KEY (symbol, timeframe)
+        )
+    """)
     con.commit()
     return con
+
+
+def zone_transitioned(con, symbol: str, timeframe: str, zone: str) -> bool:
+    """
+    Returns True (and records the new zone) only if this zone differs from the
+    last one recorded for this symbol/timeframe -- so a 'watching' alert fires
+    once per transition into/out of premium/discount rather than every poll
+    cycle while price sits inside the same zone.
+    """
+    row = con.execute(
+        "SELECT zone FROM zone_watch WHERE symbol=? AND timeframe=?", (symbol, timeframe)
+    ).fetchone()
+    previous = row[0] if row else None
+    con.execute(
+        "INSERT INTO zone_watch (symbol, timeframe, zone, updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(symbol, timeframe) DO UPDATE SET zone=excluded.zone, updated_at=excluded.updated_at",
+        (symbol, timeframe, zone, datetime.now(timezone.utc).isoformat())
+    )
+    con.commit()
+    return zone != previous
 
 
 def already_alerted(con, setup: TradeSetup) -> bool:
@@ -1073,6 +1130,52 @@ Performance history for this strategy type so far (factual, from a trade log):
         return "(AI rationale unavailable)", "(AI rationale unavailable -- see levels above)"
 
 
+def get_ai_watch_commentary(symbol: str, timeframe: str, zone: str,
+                             htf_trend: int, current_price: float,
+                             pdz: "PremiumDiscountZones") -> str:
+    """
+    Short 'heads up' note for when price has just transitioned into a premium or
+    discount zone on a given timeframe -- no confirmed trigger yet, just context
+    that the bot is now watching this timeframe for a setup. Fires once per zone
+    transition (see zone_transitioned), not on every poll.
+    """
+    if not ANTHROPIC_API_KEY:
+        return f"👀 Watching the {timeframe} chart: price just entered the {zone} zone " \
+               f"({pdz.discount_top if zone == 'discount' else pdz.premium_bottom:.1f}-" \
+               f"{pdz.range_top if zone == 'premium' else pdz.range_bottom:.1f}). " \
+               f"(no ANTHROPIC_API_KEY set -- skipping AI-written note)"
+
+    scope_word = "swing" if timeframe not in ("15m", "5m", "1m") else "intraday"
+    trend_word = "bullish" if htf_trend == Bias.BULLISH else (
+        "bearish" if htf_trend == Bias.BEARISH else "undetermined")
+
+    prompt = f"""You are writing a short heads-up note for an experienced independent
+trader's private Telegram feed. Price on the {timeframe} chart has just transitioned
+into the {zone} zone of its own swing range -- this is NOT a confirmed trade trigger,
+just context that the systematic bot is now actively watching this timeframe for a
+possible setup. Do not recommend a trade, do not add a confidence score, do not add
+disclaimers -- they already know this is not financial advice.
+
+Respond with ONE short sentence (under 25 words) in this spirit: "Watching the
+{timeframe} {scope_word}: price is in the {zone} zone, watching for a [premium-fade
+short / discount-fade long / continuation] confirmation."
+
+Data:
+- Symbol: {symbol}
+- Timeframe: {timeframe} ({scope_word})
+- Zone: {zone}
+- Zone range: {pdz.discount_top if zone == 'discount' else pdz.premium_bottom:.1f} to \
+{pdz.range_top if zone == 'premium' else pdz.range_bottom:.1f}
+- Current price: {current_price:.1f}
+- Broader swing trend on this same range: {trend_word}
+"""
+    try:
+        return _call_claude(prompt, max_tokens=100).strip()
+    except Exception as e:
+        log.warning(f"AI watch commentary call failed: {e}")
+        return f"👀 Watching the {timeframe} chart: price just entered the {zone} zone."
+
+
 def get_ai_outcome_commentary(closed: dict, stats: dict) -> str:
     """
     Short reflection once a tracked setup resolves (TP or SL hit): notes what
@@ -1241,6 +1344,20 @@ def run_once(exchange, engine: SMCEngine, con):
 
     htf_state = engine.run(htf_df)
     ltf_state = engine.run(ltf_df)
+
+    # 2a. "Watching" alerts -- fire once per zone transition on each timeframe
+    # independently (4h swing and 15m intraday), before any trigger has confirmed.
+    for tf, df, state in ((HTF, htf_df, htf_state), (LTF, ltf_df, ltf_state)):
+        if state.trailing_top is None or state.trailing_bottom is None:
+            continue
+        pdz = engine.premium_discount_zones(state)
+        price = df["close"].iloc[-1]
+        zone = engine.classify_zone(price, pdz)
+        if zone == "equilibrium":
+            continue  # only premium/discount are worth a watch note
+        if zone_transitioned(con, SYMBOL, tf, zone):
+            note = get_ai_watch_commentary(SYMBOL, tf, zone, state.swing_trend, price, pdz)
+            send_telegram_text(note)
 
     setup = find_setup(SYMBOL, htf_df, htf_state, HTF, ltf_df, ltf_state, LTF, engine)
     if setup is None:
