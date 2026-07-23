@@ -468,11 +468,17 @@ def find_premium_discount_setup(symbol: str,
                                  engine: SMCEngine,
                                  sl_buffer_atr_mult: float = 0.25,
                                  fvg_equilibrium_tolerance_pct: float = 0.15,
-                                 min_rr: float = 1.5) -> Optional[TradeSetup]:
+                                 min_rr: float = 1.5,
+                                 max_rr: float = 6.0) -> Optional[TradeSetup]:
     """
     Checks the HTF range for a premium/discount fade setup. Uses HTF structure for the
     range/zones (that's what the examples use -- 2h and weekly), and the LTF close as
     the live price for confluence/timing.
+
+    min_rr/max_rr bound what counts as a *tradeable* setup: too low isn't worth the
+    risk, too high usually means the target (equilibrium/FVG) just happens to be far
+    from a tight structural stop rather than reflecting a realistic move -- reject
+    those rather than alert on a number that looks great on paper but rarely fills.
     """
     if htf_state.trailing_top is None or htf_state.trailing_bottom is None:
         return None
@@ -497,7 +503,7 @@ def find_premium_discount_setup(symbol: str,
         ) or pdz.equilibrium_mid
 
         rr = _rr(entry, stop_loss, take_profit)
-        if rr >= min_rr:
+        if min_rr <= rr <= max_rr:
             return TradeSetup(
                 symbol=symbol, direction=Bias.BEARISH, strategy="premium_discount_fade",
                 htf_timeframe=htf_tf, ltf_timeframe=ltf_tf, trigger_zone_kind="premium",
@@ -519,7 +525,7 @@ def find_premium_discount_setup(symbol: str,
         ) or pdz.equilibrium_mid
 
         rr = _rr(entry, stop_loss, take_profit)
-        if rr >= min_rr:
+        if min_rr <= rr <= max_rr:
             return TradeSetup(
                 symbol=symbol, direction=Bias.BULLISH, strategy="premium_discount_fade",
                 htf_timeframe=htf_tf, ltf_timeframe=ltf_tf, trigger_zone_kind="discount",
@@ -537,11 +543,18 @@ def find_continuation_setup(symbol: str,
                              htf_df: pd.DataFrame, htf_state: SMCState, htf_tf: str,
                              ltf_df: pd.DataFrame, ltf_state: SMCState, ltf_tf: str,
                              engine: SMCEngine,
-                             sl_buffer_atr_mult: float = 0.15) -> Optional[TradeSetup]:
+                             sl_buffer_atr_mult: float = 0.15,
+                             min_rr: float = 1.5,
+                             max_rr: float = 6.0) -> Optional[TradeSetup]:
     """
     Price returning into an unmitigated LTF order block / FVG that agrees with the HTF
     swing trend direction. Kept as a secondary confirmation model -- trend continuation
     rather than the fade strategy above.
+
+    Target is the HTF trailing strong high/low, which "only ever extends" per the
+    structure engine -- early in a trending move that can sit very far from a tight
+    LTF stop, producing technically-correct but unrealistic R:R (30+). min_rr/max_rr
+    reject those rather than alert on a target that isn't a credible near-term level.
     """
     if htf_state.swing_trend == Bias.NONE:
         return None
@@ -573,7 +586,7 @@ def find_continuation_setup(symbol: str,
             take_profit = htf_state.trailing_bottom
 
         rr = _rr(entry, stop_loss, take_profit)
-        if rr <= 0:
+        if not (min_rr <= rr <= max_rr):
             continue
 
         last_event = ltf_state.events[-1] if ltf_state.events else None
@@ -602,6 +615,20 @@ def find_setup(symbol: str,
         return setup
     return find_continuation_setup(symbol, htf_df, htf_state, htf_tf,
                                     ltf_df, ltf_state, ltf_tf, engine)
+
+
+def find_standalone_setup(symbol: str, df: pd.DataFrame, state: SMCState, tf: str,
+                           engine: SMCEngine) -> Optional[TradeSetup]:
+    """
+    Self-contained setup on a single timeframe -- its own swing range/trend AND its
+    own OB/FVG triggers, with no cross-timeframe bias check. This is what produces
+    independent "4h swing setup" and "15m intraday setup" alerts: call this once with
+    (htf_df, htf_state, "4h") and once with (ltf_df, ltf_state, "15m") rather than
+    always blending the two the way find_setup() does. Since htf_timeframe ==
+    ltf_timeframe on the returned TradeSetup, that equality is what downstream code
+    uses to label/scope the alert as "4h swing" vs "15m intraday".
+    """
+    return find_setup(symbol, df, state, tf, df, state, tf, engine)
 
 
 # ============================================================
@@ -749,6 +776,7 @@ def init_db():
             zone_top REAL, zone_bottom REAL, bar_time TEXT,
             sent_at TEXT,
             strategy TEXT,
+            timeframe TEXT,
             entry REAL, stop_loss REAL, take_profit REAL, rr REAL,
             status TEXT DEFAULT 'open',
             closed_at TEXT,
@@ -760,8 +788,8 @@ def init_db():
     # SQLite has no "ADD COLUMN IF NOT EXISTS", so just swallow the duplicate-column
     # error on databases that already have them.
     for col_def in [
-        "strategy TEXT", "entry REAL", "stop_loss REAL", "take_profit REAL",
-        "rr REAL", "status TEXT DEFAULT 'open'", "closed_at TEXT",
+        "strategy TEXT", "timeframe TEXT", "entry REAL", "stop_loss REAL",
+        "take_profit REAL", "rr REAL", "status TEXT DEFAULT 'open'", "closed_at TEXT",
         "exit_price REAL", "r_multiple REAL",
     ]:
         try:
@@ -775,9 +803,9 @@ def init_db():
 def already_alerted(con, setup: TradeSetup) -> bool:
     row = con.execute(
         "SELECT 1 FROM sent_alerts WHERE symbol=? AND direction=? AND zone_kind=? "
-        "AND ABS(zone_top-?) < 1 AND ABS(zone_bottom-?) < 1",
+        "AND timeframe=? AND ABS(zone_top-?) < 1 AND ABS(zone_bottom-?) < 1",
         (setup.symbol, int(setup.direction), setup.trigger_zone_kind,
-         setup.zone_top, setup.zone_bottom)
+         setup.ltf_timeframe, setup.zone_top, setup.zone_bottom)
     ).fetchone()
     return row is not None
 
@@ -785,11 +813,11 @@ def already_alerted(con, setup: TradeSetup) -> bool:
 def record_alert(con, setup: TradeSetup):
     con.execute(
         "INSERT INTO sent_alerts (symbol, direction, zone_kind, zone_top, zone_bottom, "
-        "bar_time, sent_at, strategy, entry, stop_loss, take_profit, rr, status) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open')",
+        "bar_time, sent_at, strategy, timeframe, entry, stop_loss, take_profit, rr, status) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'open')",
         (setup.symbol, int(setup.direction), setup.trigger_zone_kind,
          setup.zone_top, setup.zone_bottom, str(setup.bar_time),
-         datetime.now(timezone.utc).isoformat(), setup.strategy,
+         datetime.now(timezone.utc).isoformat(), setup.strategy, setup.ltf_timeframe,
          setup.entry, setup.stop_loss, setup.take_profit, setup.rr)
     )
     con.commit()
@@ -806,7 +834,7 @@ def check_open_setups(con, exchange):
     """
     open_rows = con.execute(
         "SELECT id, symbol, direction, entry, stop_loss, take_profit, sent_at, "
-        "strategy, rr FROM sent_alerts WHERE status='open'"
+        "strategy, rr, timeframe FROM sent_alerts WHERE status='open'"
     ).fetchall()
     if not open_rows:
         return []
@@ -823,7 +851,7 @@ def check_open_setups(con, exchange):
             log.warning(f"check_open_setups: fetch failed for {symbol}: {e}")
             continue
 
-        for (row_id, sym, direction, entry, sl, tp, sent_at, strategy, rr) in rows:
+        for (row_id, sym, direction, entry, sl, tp, sent_at, strategy, rr, timeframe) in rows:
             try:
                 sent_dt = pd.to_datetime(sent_at)
             except Exception:
@@ -863,27 +891,32 @@ def check_open_setups(con, exchange):
             closed.append({
                 "id": row_id, "symbol": sym, "direction": bias, "entry": entry,
                 "stop_loss": sl, "take_profit": tp, "strategy": strategy, "rr": rr,
-                "status": status, "exit_price": exit_price, "r_multiple": r_multiple,
+                "timeframe": timeframe, "status": status, "exit_price": exit_price,
+                "r_multiple": r_multiple,
             })
         con.commit()
     return closed
 
 
-def get_performance_stats(con, symbol: str = None):
-    """Rolling win-rate / R stats over all closed setups, overall and per-strategy."""
-    q = "SELECT strategy, status, r_multiple FROM sent_alerts WHERE status IN ('tp_hit','sl_hit')"
-    params = ()
+def get_performance_stats(con, symbol: str = None, timeframe: str = None):
+    """Rolling win-rate / R stats over all closed setups: overall, per-strategy, and
+    per-timeframe (so '4h swing' and '15m intraday' can be judged separately)."""
+    q = "SELECT strategy, status, r_multiple, timeframe FROM sent_alerts WHERE status IN ('tp_hit','sl_hit')"
+    params = []
     if symbol:
         q += " AND symbol=?"
-        params = (symbol,)
-    rows = con.execute(q, params).fetchall()
+        params.append(symbol)
+    if timeframe:
+        q += " AND timeframe=?"
+        params.append(timeframe)
+    rows = con.execute(q, tuple(params)).fetchall()
 
     def summarize(rows):
         n = len(rows)
         if n == 0:
             return {"n": 0, "wins": 0, "win_rate": None, "avg_r": None, "total_r": 0.0}
-        wins = sum(1 for _, status, _ in rows if status == "tp_hit")
-        total_r = sum(r for _, _, r in rows if r is not None)
+        wins = sum(1 for _, status, _, _ in rows if status == "tp_hit")
+        total_r = sum(r for _, _, r, _ in rows if r is not None)
         return {
             "n": n, "wins": wins, "win_rate": wins / n,
             "avg_r": total_r / n, "total_r": total_r,
@@ -893,7 +926,10 @@ def get_performance_stats(con, symbol: str = None):
     by_strategy = {}
     for strat in {r[0] for r in rows if r[0]}:
         by_strategy[strat] = summarize([r for r in rows if r[0] == strat])
-    return {"overall": overall, "by_strategy": by_strategy}
+    by_timeframe = {}
+    for tf in {r[3] for r in rows if r[3]}:
+        by_timeframe[tf] = summarize([r for r in rows if r[3] == tf])
+    return {"overall": overall, "by_strategy": by_strategy, "by_timeframe": by_timeframe}
 
 
 # --------------------------------------------------------------------------- data
