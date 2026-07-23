@@ -613,19 +613,63 @@ def render_setup_chart(df, state: SMCState, setup: TradeSetup, out_path: str,
                         lookback_bars: int = 150):
     plot_df = df.tail(lookback_bars).copy()
     plot_df.index.name = "Date"
+    # mplfinance itself is case-insensitive about OHLC column names, but our own
+    # y-axis clipping logic below reads plot_df["High"]/["Low"] directly -- normalize
+    # here so this works whether the caller passes lowercase (ccxt-style) or
+    # capitalized columns.
+    plot_df.columns = [str(c).capitalize() for c in plot_df.columns]
 
-    addplots = []
+    # A custom style gives more control over grid/spine visibility than the stock
+    # "nightclouds" preset and reads cleaner at chart-snapshot sizes.
+    mc = mpf.make_marketcolors(
+        up="#089981", down="#F23645", edge="inherit", wick="inherit",
+        volume="inherit",
+    )
+    style = mpf.make_mpf_style(
+        base_mpf_style="nightclouds",
+        marketcolors=mc,
+        facecolor="#0a0e14",
+        figcolor="#0a0e14",
+        gridcolor="#1c2230",
+        gridstyle="--",
+        rc={"axes.labelcolor": "#e8eaed", "xtick.color": "#8a92a3", "ytick.color": "#8a92a3"},
+    )
+
+    # Reserve empty bars on the right so price labels have room to sit beside the
+    # chart instead of overlapping the last candles or getting clipped at the edge.
+    label_pad_bars = max(8, lookback_bars // 12)
+
     fig, axlist = mpf.plot(
         plot_df,
         type="candle",
-        style="nightclouds",
+        style=style,
         volume=False,
         returnfig=True,
-        figsize=(11, 6.5),
+        figsize=(13, 7.5),
+        figscale=1.1,
+        tight_layout=False,
         title=f"\n{setup.symbol}  {setup.ltf_timeframe} (HTF bias: {setup.htf_timeframe})",
     )
     ax = axlist[0]
     x0, x1 = ax.get_xlim()
+    ax.set_xlim(x0, x1 + label_pad_bars)
+
+    # --- y-axis: clip to recent price action instead of stretching to fit levels
+    # that may sit far away (e.g. a distant TP on a high-RR setup). Without this,
+    # a single far-off axhline compresses every candle into a thin band.
+    recent_high = plot_df["High"].max()
+    recent_low = plot_df["Low"].min()
+    visible_lo = min(recent_low, setup.entry, setup.stop_loss)
+    visible_hi = max(recent_high, setup.entry, setup.stop_loss)
+    pad = (visible_hi - visible_lo) * 0.08
+    visible_lo -= pad
+    visible_hi += pad
+
+    tp_in_range = visible_lo <= setup.take_profit <= visible_hi
+    if tp_in_range:
+        visible_lo = min(visible_lo, setup.take_profit - pad * 0.3)
+        visible_hi = max(visible_hi, setup.take_profit + pad * 0.3)
+    ax.set_ylim(visible_lo, visible_hi)
 
     # highlight the trigger zone (order block / FVG)
     zone_color = "#1848cc" if setup.direction == Bias.BULLISH else "#b22833"
@@ -633,28 +677,45 @@ def render_setup_chart(df, state: SMCState, setup: TradeSetup, out_path: str,
                color=zone_color, alpha=0.25,
                label=f"{setup.trigger_zone_kind.replace('_', ' ')} zone")
 
-    # entry / SL / TP lines
+    label_x = x1 + label_pad_bars * 0.15
+
+    # entry / SL lines -- always inside the visible range
     ax.axhline(setup.entry, color="#e8eaed", linestyle="--", linewidth=1.2)
-    ax.text(x1, setup.entry, f" Entry {setup.entry:,.1f}", color="#e8eaed",
-            va="center", fontsize=9)
+    ax.annotate(f" Entry {setup.entry:,.1f}", xy=(label_x, setup.entry),
+                color="#e8eaed", va="center", fontsize=9.5, annotation_clip=False)
 
     ax.axhline(setup.stop_loss, color="#F23645", linestyle="--", linewidth=1.2)
-    ax.text(x1, setup.stop_loss, f" SL {setup.stop_loss:,.1f}", color="#F23645",
-            va="center", fontsize=9)
+    ax.annotate(f" SL {setup.stop_loss:,.1f}", xy=(label_x, setup.stop_loss),
+                color="#F23645", va="center", fontsize=9.5, annotation_clip=False)
 
-    ax.axhline(setup.take_profit, color="#089981", linestyle="--", linewidth=1.2)
-    ax.text(x1, setup.take_profit, f" TP {setup.take_profit:,.1f}", color="#089981",
-            va="center", fontsize=9)
+    if tp_in_range:
+        ax.axhline(setup.take_profit, color="#089981", linestyle="--", linewidth=1.2)
+        ax.annotate(f" TP {setup.take_profit:,.1f}", xy=(label_x, setup.take_profit),
+                    color="#089981", va="center", fontsize=9.5, annotation_clip=False)
+    else:
+        # TP sits well outside the recent price range -- annotate it at the edge
+        # of the visible band with an arrow + distance, rather than distorting
+        # the whole chart's scale to include it.
+        going_up = setup.take_profit > visible_hi
+        edge_y = visible_hi - pad * 0.6 if going_up else visible_lo + pad * 0.6
+        arrow = "↑" if going_up else "↓"
+        distance = abs(setup.take_profit - (visible_hi if going_up else visible_lo))
+        ax.annotate(
+            f" {arrow} TP {setup.take_profit:,.1f}\n   ({distance:,.0f} pts off-chart)",
+            xy=(label_x, edge_y), color="#089981", va="center", fontsize=9,
+            annotation_clip=False,
+        )
 
     direction_word = "LONG" if setup.direction == Bias.BULLISH else "SHORT"
     ax.set_title(
         f"{setup.symbol} — {direction_word} setup ({setup.trigger_zone_kind}) "
         f"RR {setup.rr}  |  HTF {setup.htf_timeframe} trend: "
         f"{'UP' if setup.htf_trend == Bias.BULLISH else 'DOWN'}",
-        fontsize=11, color="#e8eaed"
+        fontsize=11.5, color="#e8eaed", pad=12,
     )
 
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor="#0a0e14")
+    fig.subplots_adjust(left=0.07, right=0.86, top=0.90, bottom=0.10)
+    fig.savefig(out_path, dpi=150, facecolor="#0a0e14")
     plt.close(fig)
     return out_path
 
@@ -686,9 +747,27 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT, direction INTEGER, zone_kind TEXT,
             zone_top REAL, zone_bottom REAL, bar_time TEXT,
-            sent_at TEXT
+            sent_at TEXT,
+            strategy TEXT,
+            entry REAL, stop_loss REAL, take_profit REAL, rr REAL,
+            status TEXT DEFAULT 'open',
+            closed_at TEXT,
+            exit_price REAL,
+            r_multiple REAL
         )
     """)
+    # Migration path for DBs created before outcome-tracking columns existed --
+    # SQLite has no "ADD COLUMN IF NOT EXISTS", so just swallow the duplicate-column
+    # error on databases that already have them.
+    for col_def in [
+        "strategy TEXT", "entry REAL", "stop_loss REAL", "take_profit REAL",
+        "rr REAL", "status TEXT DEFAULT 'open'", "closed_at TEXT",
+        "exit_price REAL", "r_multiple REAL",
+    ]:
+        try:
+            con.execute(f"ALTER TABLE sent_alerts ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass
     con.commit()
     return con
 
@@ -706,12 +785,115 @@ def already_alerted(con, setup: TradeSetup) -> bool:
 def record_alert(con, setup: TradeSetup):
     con.execute(
         "INSERT INTO sent_alerts (symbol, direction, zone_kind, zone_top, zone_bottom, "
-        "bar_time, sent_at) VALUES (?,?,?,?,?,?,?)",
+        "bar_time, sent_at, strategy, entry, stop_loss, take_profit, rr, status) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'open')",
         (setup.symbol, int(setup.direction), setup.trigger_zone_kind,
          setup.zone_top, setup.zone_bottom, str(setup.bar_time),
-         datetime.now(timezone.utc).isoformat())
+         datetime.now(timezone.utc).isoformat(), setup.strategy,
+         setup.entry, setup.stop_loss, setup.take_profit, setup.rr)
     )
     con.commit()
+
+
+# ------------------------------------------------------------------- outcome tracking
+def check_open_setups(con, exchange):
+    """
+    For every 'open' setup, pull LTF candles since it was sent and check whether
+    price has touched TP or SL. Uses candle high/low (not just close) so a wick
+    through a level still counts as a hit. If a single candle touches both TP and
+    SL, we conservatively record SL first -- we can't know intrabar sequencing from
+    OHLC alone. Returns the list of setups that closed this pass.
+    """
+    open_rows = con.execute(
+        "SELECT id, symbol, direction, entry, stop_loss, take_profit, sent_at, "
+        "strategy, rr FROM sent_alerts WHERE status='open'"
+    ).fetchall()
+    if not open_rows:
+        return []
+
+    by_symbol = {}
+    for row in open_rows:
+        by_symbol.setdefault(row[1], []).append(row)
+
+    closed = []
+    for symbol, rows in by_symbol.items():
+        try:
+            df = fetch_ohlcv(exchange, symbol, LTF, limit=500)
+        except Exception as e:
+            log.warning(f"check_open_setups: fetch failed for {symbol}: {e}")
+            continue
+
+        for (row_id, sym, direction, entry, sl, tp, sent_at, strategy, rr) in rows:
+            try:
+                sent_dt = pd.to_datetime(sent_at)
+            except Exception:
+                continue
+            window = df[df.index >= sent_dt]
+            if window.empty:
+                continue
+
+            bias = Bias(direction)
+            if bias == Bias.BULLISH:
+                tp_bars = window[window["high"] >= tp]
+                sl_bars = window[window["low"] <= sl]
+            else:
+                tp_bars = window[window["low"] <= tp]
+                sl_bars = window[window["high"] >= sl]
+
+            tp_time = tp_bars.index[0] if not tp_bars.empty else None
+            sl_time = sl_bars.index[0] if not sl_bars.empty else None
+            if tp_time is None and sl_time is None:
+                continue  # still open
+
+            if sl_time is not None and (tp_time is None or sl_time <= tp_time):
+                status, exit_price = "sl_hit", sl
+            else:
+                status, exit_price = "tp_hit", tp
+
+            risk = abs(entry - sl)
+            direction_sign = 1 if bias == Bias.BULLISH else -1
+            r_multiple = ((exit_price - entry) * direction_sign / risk) if risk else 0.0
+
+            closed_at = datetime.now(timezone.utc).isoformat()
+            con.execute(
+                "UPDATE sent_alerts SET status=?, closed_at=?, exit_price=?, "
+                "r_multiple=? WHERE id=?",
+                (status, closed_at, exit_price, r_multiple, row_id)
+            )
+            closed.append({
+                "id": row_id, "symbol": sym, "direction": bias, "entry": entry,
+                "stop_loss": sl, "take_profit": tp, "strategy": strategy, "rr": rr,
+                "status": status, "exit_price": exit_price, "r_multiple": r_multiple,
+            })
+        con.commit()
+    return closed
+
+
+def get_performance_stats(con, symbol: str = None):
+    """Rolling win-rate / R stats over all closed setups, overall and per-strategy."""
+    q = "SELECT strategy, status, r_multiple FROM sent_alerts WHERE status IN ('tp_hit','sl_hit')"
+    params = ()
+    if symbol:
+        q += " AND symbol=?"
+        params = (symbol,)
+    rows = con.execute(q, params).fetchall()
+
+    def summarize(rows):
+        n = len(rows)
+        if n == 0:
+            return {"n": 0, "wins": 0, "win_rate": None, "avg_r": None, "total_r": 0.0}
+        wins = sum(1 for _, status, _ in rows if status == "tp_hit")
+        total_r = sum(r for _, _, r in rows if r is not None)
+        return {
+            "n": n, "wins": wins, "win_rate": wins / n,
+            "avg_r": total_r / n, "total_r": total_r,
+        }
+
+    overall = summarize(rows)
+    by_strategy = {}
+    for strat in {r[0] for r in rows if r[0]}:
+        by_strategy[strat] = summarize([r for r in rows if r[0] == strat])
+    return {"overall": overall, "by_strategy": by_strategy}
 
 
 # --------------------------------------------------------------------------- data
@@ -725,15 +907,77 @@ def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 500) -> pd.D
 
 
 # ----------------------------------------------------------------------------- LLM
-def get_ai_rationale(setup: TradeSetup) -> str:
+def _format_stats_block(stats: dict) -> str:
+    """Turns get_performance_stats() output into a short plain-text block for prompts."""
+    overall = stats.get("overall", {})
+    if not overall or overall.get("n", 0) == 0:
+        return "No closed setups yet -- this would be the first one tracked to an outcome."
+
+    lines = [
+        f"Overall so far: {overall['n']} closed setups, {overall['wins']} hit TP "
+        f"({overall['win_rate']*100:.0f}% win rate), total {overall['total_r']:+.2f}R, "
+        f"avg {overall['avg_r']:+.2f}R per setup."
+    ]
+    for strat, s in stats.get("by_strategy", {}).items():
+        if s["n"] == 0:
+            continue
+        label = "Premium/Discount Fade" if strat == "premium_discount_fade" else "OB/FVG Continuation"
+        lines.append(
+            f"{label}: {s['n']} closed, {s['wins']} wins ({s['win_rate']*100:.0f}%), "
+            f"avg {s['avg_r']:+.2f}R."
+        )
+    return "\n".join(lines)
+
+
+def _call_claude(prompt: str, max_tokens: int = 300) -> str:
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+
+
+def _split_tldr(text: str) -> tuple[str, str]:
+    """Splits a 'TLDR: ...\\nANALYSIS: ...' response into (tldr, analysis). Falls back
+    gracefully if the model didn't follow the format exactly."""
+    tldr, analysis = "", text
+    if "ANALYSIS:" in text:
+        head, _, tail = text.partition("ANALYSIS:")
+        analysis = tail.strip()
+        if "TLDR:" in head:
+            tldr = head.split("TLDR:", 1)[1].strip()
+    elif "TLDR:" in text:
+        head, _, tail = text.partition("TLDR:")
+        # TLDR came with nothing after it labeled ANALYSIS -- treat rest as tldr, no analysis
+        tldr = tail.strip()
+        analysis = ""
+    return tldr, analysis
+
+
+def get_ai_rationale(setup: TradeSetup, stats: dict = None) -> tuple[str, str]:
     """
-    Asks Claude for a short, structured technical readout of the setup. This is
-    descriptive market-structure commentary based on the data you already computed --
-    not a prediction and not financial advice, and the prompt says so explicitly so
-    the model doesn't try to hedge or refuse.
+    Asks Claude for a short structured technical readout of the setup: a one-line
+    TLDR plus a fuller 3-4 sentence analysis. This is descriptive market-structure
+    commentary based on data already computed -- not a prediction and not financial
+    advice, and the prompt says so explicitly. Also feeds in rolling win-rate/R stats
+    so the commentary can note (factually, without hyping or advising) how this
+    strategy has actually been performing so far.
+    Returns (tldr, full_analysis) -- either may be "" if the call fails.
     """
     if not ANTHROPIC_API_KEY:
-        return "(no ANTHROPIC_API_KEY set -- skipping AI rationale)"
+        return "(no ANTHROPIC_API_KEY set)", "(no ANTHROPIC_API_KEY set -- skipping AI rationale)"
 
     direction_word = "long" if setup.direction == Bias.BULLISH else "short"
     if setup.strategy == "premium_discount_fade":
@@ -749,13 +993,21 @@ def get_ai_rationale(setup: TradeSetup) -> str:
             f"that agrees with the {setup.htf_timeframe} swing trend"
         )
 
+    stats_block = _format_stats_block(stats or {})
+
     prompt = f"""You are annotating a systematic SMC (smart money concepts) trade alert
 for an experienced independent trader's own private Telegram feed. All the technical
-levels below were already computed algorithmically -- your job is only to write a
-tight 3-4 sentence readout explaining the structural logic in plain language, and one
-sentence noting the main invalidation risk. Do not add a confidence score, do not tell
-the reader whether to take the trade, do not add disclaimers -- they already know this
-is not financial advice.
+levels below were already computed algorithmically -- your job is to write it up.
+Do not add a confidence score, do not tell the reader whether to take the trade, do
+not add disclaimers -- they already know this is not financial advice.
+
+Respond in EXACTLY this format, nothing before or after:
+TLDR: <one punchy sentence, under 20 words, direction + trigger + the key number that matters>
+ANALYSIS: <3-4 sentences on the structural logic in plain language, then one sentence
+on the main invalidation risk. If the performance history below is non-empty, close
+with one factual sentence on how this strategy type has been performing across past
+closed setups -- grounded in the actual numbers, no hype, no advice, just what the
+data shows so far.>
 
 Setup type: {strategy_desc}
 
@@ -770,28 +1022,55 @@ Setup data:
 - Stop loss: {setup.stop_loss:.1f}
 - Take profit: {setup.take_profit:.1f}
 - R:R: {setup.rr}
+
+Performance history for this strategy type so far (factual, from a trade log):
+{stats_block}
 """
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 300,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+        text = _call_claude(prompt, max_tokens=350)
+        tldr, analysis = _split_tldr(text)
+        if not tldr and not analysis:
+            return "(AI rationale unavailable)", "(AI rationale unavailable -- see levels above)"
+        return tldr or "(see analysis below)", analysis or text
     except Exception as e:
         log.warning(f"AI rationale call failed: {e}")
-        return "(AI rationale unavailable -- see levels above)"
+        return "(AI rationale unavailable)", "(AI rationale unavailable -- see levels above)"
+
+
+def get_ai_outcome_commentary(closed: dict, stats: dict) -> str:
+    """
+    Short reflection once a tracked setup resolves (TP or SL hit): notes what
+    happened and, grounded in the running stats, how the strategy is doing overall.
+    This is what makes the bot feel like it's actually following its own calls
+    instead of firing alerts into the void.
+    """
+    if not ANTHROPIC_API_KEY:
+        return "(no ANTHROPIC_API_KEY set -- skipping outcome commentary)"
+
+    outcome_word = "hit TAKE PROFIT" if closed["status"] == "tp_hit" else "hit STOP LOSS"
+    strategy_label = "Premium/Discount Fade" if closed["strategy"] == "premium_discount_fade" \
+        else "OB/FVG Continuation"
+    stats_block = _format_stats_block(stats)
+
+    prompt = f"""A systematic SMC trade setup you previously flagged has just resolved.
+Write a tight 2-3 sentence follow-up for the trader's private Telegram feed: state
+what happened plainly, then -- grounded strictly in the performance numbers below,
+no hype, no advice, no "should you keep trading this" language -- note factually
+whether this strategy type is holding up so far or not. If the sample size is still
+small, say so plainly instead of drawing a conclusion from too little data.
+
+Setup: {closed['symbol']} {"LONG" if closed['direction'] == Bias.BULLISH else "SHORT"} via {strategy_label}
+Entry: {closed['entry']:.1f} | Stop: {closed['stop_loss']:.1f} | Target: {closed['take_profit']:.1f}
+Result: {outcome_word} at {closed['exit_price']:.1f} ({closed['r_multiple']:+.2f}R)
+
+Performance history for this strategy type (including this result):
+{stats_block}
+"""
+    try:
+        return _call_claude(prompt, max_tokens=220)
+    except Exception as e:
+        log.warning(f"AI outcome commentary call failed: {e}")
+        return "(AI outcome commentary unavailable)"
 
 
 # ------------------------------------------------------------------------ telegram
@@ -806,19 +1085,38 @@ def _truncate(text: str, limit: int) -> str:
     return text[: max(0, limit - 1)].rstrip() + "…"
 
 
-def send_telegram_alert(setup: TradeSetup, rationale: str, chart_path: str):
+def send_telegram_text(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured -- printing message instead:")
+        print(text)
+        return
+    message_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    r = requests.post(
+        message_url,
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": _truncate(text, TELEGRAM_MESSAGE_LIMIT),
+              "parse_mode": "Markdown"},
+        timeout=30,
+    )
+    if not r.ok:
+        log.error(f"Telegram text send failed: {r.status_code} {r.text}")
+    else:
+        log.info("Telegram text message sent")
+
+
+def send_telegram_alert(setup: TradeSetup, tldr: str, analysis: str, chart_path: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured -- printing alert instead:")
-        print(rationale)
+        print(tldr)
+        print(analysis)
         return
 
     direction_word = "🟢 LONG" if setup.direction == Bias.BULLISH else "🔴 SHORT"
     strategy_label = "Premium/Discount Fade" if setup.strategy == "premium_discount_fade" \
         else "OB/FVG Continuation"
 
-    # Levels-only caption goes on the photo -- keep this short and predictable so it
-    # never risks tripping the 1024-char sendPhoto caption limit, regardless of how
-    # long the AI rationale ends up being.
+    # Levels + TLDR go on the photo caption -- kept short and predictable (TLDR is
+    # capped by prompt to ~20 words) so it never risks tripping the 1024-char
+    # sendPhoto caption limit, regardless of how long the full analysis runs.
     caption = (
         f"*{setup.symbol}* — {direction_word} setup ({strategy_label})\n"
         f"HTF {setup.htf_timeframe} bias: {'UP' if setup.htf_trend == Bias.BULLISH else 'DOWN'}  "
@@ -826,7 +1124,8 @@ def send_telegram_alert(setup: TradeSetup, rationale: str, chart_path: str):
         f"Entry: `{setup.entry:,.1f}`\n"
         f"Stop: `{setup.stop_loss:,.1f}`\n"
         f"Target: `{setup.take_profit:,.1f}`\n"
-        f"R:R: `{setup.rr}`"
+        f"R:R: `{setup.rr}`\n\n"
+        f"_TLDR: {tldr}_"
     )
     caption = _truncate(caption, TELEGRAM_CAPTION_LIMIT)
 
@@ -843,24 +1142,64 @@ def send_telegram_alert(setup: TradeSetup, rationale: str, chart_path: str):
         return
     log.info("Telegram photo alert sent")
 
-    # Rationale as a separate follow-up message -- 4096-char budget, still truncated
-    # defensively in case Claude ever returns something unusually long.
-    if rationale:
-        message_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        message_text = _truncate(rationale, TELEGRAM_MESSAGE_LIMIT)
-        r2 = requests.post(
-            message_url,
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": message_text},
-            timeout=30,
-        )
-        if not r2.ok:
-            log.error(f"Telegram rationale send failed: {r2.status_code} {r2.text}")
-        else:
-            log.info("Telegram rationale message sent")
+    # Full analysis as a separate follow-up message -- 4096-char budget, still
+    # truncated defensively in case Claude ever returns something unusually long.
+    if analysis:
+        send_telegram_text(analysis)
+
+
+def send_telegram_outcome(closed: dict, commentary: str):
+    outcome_emoji = "✅" if closed["status"] == "tp_hit" else "❌"
+    outcome_word = "TP HIT" if closed["status"] == "tp_hit" else "SL HIT"
+    direction_word = "LONG" if closed["direction"] == Bias.BULLISH else "SHORT"
+    strategy_label = "Premium/Discount Fade" if closed["strategy"] == "premium_discount_fade" \
+        else "OB/FVG Continuation"
+
+    text = (
+        f"{outcome_emoji} *{outcome_word}* — {closed['symbol']} {direction_word} "
+        f"({strategy_label})\n"
+        f"Exit: `{closed['exit_price']:,.1f}`  |  Result: `{closed['r_multiple']:+.2f}R`\n\n"
+        f"{commentary}"
+    )
+    send_telegram_text(text)
+
+
+def send_performance_recap(stats: dict):
+    overall = stats.get("overall", {})
+    if not overall or overall.get("n", 0) == 0:
+        return
+    lines = [f"📊 *Performance recap* — {overall['n']} closed setups so far"]
+    lines.append(
+        f"Win rate: `{overall['win_rate']*100:.0f}%`  |  Total: `{overall['total_r']:+.2f}R`  "
+        f"|  Avg: `{overall['avg_r']:+.2f}R`"
+    )
+    for strat, s in stats.get("by_strategy", {}).items():
+        if s["n"] == 0:
+            continue
+        label = "Premium/Discount Fade" if strat == "premium_discount_fade" else "OB/FVG Continuation"
+        lines.append(f"• {label}: `{s['n']}` closed, `{s['win_rate']*100:.0f}%` win rate, "
+                     f"`{s['avg_r']:+.2f}R` avg")
+    send_telegram_text("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------- core
+RECAP_EVERY_N_CLOSED = int(os.getenv("SMC_RECAP_EVERY_N_CLOSED", "5"))
+
+
 def run_once(exchange, engine: SMCEngine, con):
+    # 1. Check whether any previously-alerted setups have hit TP or SL.
+    closed_list = check_open_setups(con, exchange)
+    for closed in closed_list:
+        log.info(f"Setup closed: {closed}")
+        stats = get_performance_stats(con, symbol=closed["symbol"])
+        commentary = get_ai_outcome_commentary(closed, stats)
+        send_telegram_outcome(closed, commentary)
+
+        total_closed = stats["overall"]["n"]
+        if total_closed and total_closed % RECAP_EVERY_N_CLOSED == 0:
+            send_performance_recap(stats)
+
+    # 2. Look for a new setup.
     htf_df = fetch_ohlcv(exchange, SYMBOL, HTF)
     ltf_df = fetch_ohlcv(exchange, SYMBOL, LTF)
 
@@ -879,8 +1218,9 @@ def run_once(exchange, engine: SMCEngine, con):
     log.info(f"New setup: {setup}")
     chart_path = f"/tmp/smc_setup_{int(time.time())}.png"
     render_setup_chart(ltf_df, ltf_state, setup, chart_path)
-    rationale = get_ai_rationale(setup)
-    send_telegram_alert(setup, rationale, chart_path)
+    stats = get_performance_stats(con, symbol=setup.symbol)
+    tldr, analysis = get_ai_rationale(setup, stats)
+    send_telegram_alert(setup, tldr, analysis, chart_path)
     record_alert(con, setup)
 
 
