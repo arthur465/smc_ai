@@ -575,6 +575,48 @@ def find_premium_discount_setup(symbol: str,
 
 
 # ------------------------------------------------------- primary: OB + FVG confluence entry
+def daily_context_summary(daily_df: pd.DataFrame, daily_state: SMCState,
+                           engine: SMCEngine) -> dict:
+    """
+    Daily was previously only used for its zone (premium/discount) and swing trend --
+    never for its own order blocks, so "we're currently retesting a daily bullish OB"
+    never got surfaced anywhere even though the OB engine tracks it fine. This pulls
+    that context together: current daily zone, and whether price is presently sitting
+    inside an unmitigated daily OB (with FVG-confluence status), so it can be included
+    in every alert as standing context -- not just at the moment the daily zone
+    happens to flip.
+
+    Returns a dict with 'zone', 'trend', 'ob' (OrderBlock or None), 'ob_has_fvg' (bool),
+    and 'text' (a ready-to-use one-line human summary).
+    """
+    if daily_state.trailing_top is None or daily_state.trailing_bottom is None:
+        return {"zone": "unknown", "trend": Bias.NONE, "ob": None, "ob_has_fvg": False,
+                "text": "Daily: not enough history yet to establish a range."}
+
+    pdz = engine.premium_discount_zones(daily_state)
+    price = daily_df["close"].iloc[-1]
+    zone = engine.classify_zone(price, pdz)
+    trend = daily_state.swing_trend
+
+    all_obs = (engine.active_order_blocks(daily_state, internal=True) +
+               engine.active_order_blocks(daily_state, internal=False))
+    active_ob = next((ob for ob in all_obs if ob.bar_low <= price <= ob.bar_high), None)
+
+    trend_word = "bullish" if trend == Bias.BULLISH else ("bearish" if trend == Bias.BEARISH else "undetermined")
+    if active_ob is not None:
+        ob_dir_word = "BULLISH" if active_ob.bias == Bias.BULLISH else "BEARISH"
+        confluence = _ob_fvg_confluence(daily_state, active_ob) is not None
+        text = (f"Daily: in {zone} zone, swing trend {trend_word}, currently retesting a "
+                f"{ob_dir_word} order block ({active_ob.bar_low:,.1f}-{active_ob.bar_high:,.1f})"
+                f"{' with FVG confluence' if confluence else ' (no FVG confluence)'}.")
+    else:
+        text = f"Daily: in {zone} zone, swing trend {trend_word}, not currently inside any active order block."
+
+    return {"zone": zone, "trend": trend, "ob": active_ob,
+            "ob_has_fvg": active_ob is not None and _ob_fvg_confluence(daily_state, active_ob) is not None,
+            "text": text}
+
+
 def htf_zone_direction(htf_df: pd.DataFrame, htf_state: SMCState, engine: SMCEngine):
     """
     THE top-down gate: what direction is even allowed to be considered for an entry,
@@ -1294,7 +1336,8 @@ def _split_tldr(text: str) -> tuple[str, str]:
     return tldr, analysis
 
 
-def get_ai_rationale(setup: TradeSetup, stats: dict = None) -> tuple[str, str]:
+def get_ai_rationale(setup: TradeSetup, stats: dict = None,
+                      daily_context_text: str = "") -> tuple[str, str]:
     """
     Asks Claude for a short structured technical readout of the setup: a one-line
     TLDR plus a fuller 3-4 sentence analysis. This is descriptive market-structure
@@ -1341,17 +1384,20 @@ financial advice.
 Respond in EXACTLY this format, nothing before or after:
 TLDR: <one punchy sentence, under 20 words, direction + grade + the key number that matters>
 ANALYSIS: <3-4 sentences on the structural logic in plain language (mention the OB/FVG
-confluence status and any top-down alignment/conflict notes below), then one sentence
-on the main invalidation risk. If the performance history below is non-empty, close
-with one factual sentence on how this strategy type has been performing across past
-closed setups -- grounded in the actual numbers, no hype, no advice, just what the
-data shows so far.>
+confluence status and any top-down alignment/conflict notes below, and explicitly state
+the current daily context line below -- the trader wants the daily's own zone/OB status
+spelled out, not just implied by the grade), then one sentence on the main invalidation
+risk. If the performance history below is non-empty, close with one factual sentence on
+how this strategy type has been performing across past closed setups -- grounded in the
+actual numbers, no hype, no advice, just what the data shows so far.>
 
 Setup type: {strategy_desc}
 
 Grade: {setup.grade}
 Top-down alignment notes:
 {notes_block}
+
+Current daily context: {daily_context_text or "(daily context unavailable)"}
 
 Setup data:
 - Symbol: {setup.symbol}
@@ -1524,7 +1570,8 @@ def send_telegram_text(text: str):
         log.info("Telegram text message sent")
 
 
-def send_telegram_alert(setup: TradeSetup, tldr: str, analysis: str, chart_path: str):
+def send_telegram_alert(setup: TradeSetup, tldr: str, analysis: str, chart_path: str,
+                         daily_context_text: str = ""):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured -- printing alert instead:")
         print(tldr)
@@ -1537,6 +1584,7 @@ def send_telegram_alert(setup: TradeSetup, tldr: str, analysis: str, chart_path:
     grade_emoji = {"A": "🅰️", "B+": "🅱️➕", "B": "🅱️"}.get(setup.grade, "")
     confluence_word = "OB+FVG confluence ✅" if setup.has_fvg_confluence else "OB only, no FVG ⚠️"
     notes_line = ("\n".join(f"⚠️ {n}" for n in setup.grade_notes) + "\n\n") if setup.grade_notes else ""
+    daily_line = f"📅 {daily_context_text}\n\n" if daily_context_text else ""
 
     # Levels + TLDR go on the photo caption -- kept short and predictable (TLDR is
     # capped by prompt to ~20 words) so it never risks tripping the 1024-char
@@ -1545,6 +1593,7 @@ def send_telegram_alert(setup: TradeSetup, tldr: str, analysis: str, chart_path:
         f"*{setup.symbol}* — {direction_word}  *[Grade {setup.grade}]* {grade_emoji} ({strategy_label})\n"
         f"HTF {setup.htf_timeframe} bias: {'UP' if setup.htf_trend == Bias.BULLISH else 'DOWN'}  "
         f"| Trigger: {setup.trigger_zone_kind.replace('_', ' ')} -- {confluence_word}\n\n"
+        f"{daily_line}"
         f"Entry: `{setup.entry:,.1f}`\n"
         f"Stop: `{setup.stop_loss:,.1f}`\n"
         f"Target: `{setup.take_profit:,.1f}`\n"
@@ -1573,7 +1622,8 @@ def send_telegram_alert(setup: TradeSetup, tldr: str, analysis: str, chart_path:
         send_telegram_text(analysis)
 
 
-def send_telegram_watch_photo(setup: TradeSetup, note: str, chart_path: str):
+def send_telegram_watch_photo(setup: TradeSetup, note: str, chart_path: str,
+                               daily_context_text: str = ""):
     """
     Same visual as a confirmed setup alert (OB/FVG bands, entry/SL/TP lines, grade),
     but explicitly labeled WATCHING so it reads as a heads-up preview -- not a signal
@@ -1585,10 +1635,12 @@ def send_telegram_watch_photo(setup: TradeSetup, note: str, chart_path: str):
         return
 
     direction_word = "possible LONG" if setup.direction == Bias.BULLISH else "possible SHORT"
+    daily_line = f"📅 {daily_context_text}\n\n" if daily_context_text else ""
     caption = (
         f"👀 *WATCHING* — *{setup.symbol}* {setup.htf_timeframe} — {direction_word}  "
         f"[Grade preview: {setup.grade}]\n"
         f"{'OB+FVG confluence' if setup.has_fvg_confluence else 'OB only, no FVG yet'}\n\n"
+        f"{daily_line}"
         f"Entry: `{setup.entry:,.1f}`\n"
         f"Stop: `{setup.stop_loss:,.1f}`\n"
         f"Target: `{setup.take_profit:,.1f}`\n\n"
@@ -1677,6 +1729,7 @@ def run_once(exchange, engine: SMCEngine, con):
     # candidate never gets shown while the 4h is in premium (or vice versa) --
     # matching the same top-down gate confirmed setups now use.
     htf_allowed_direction, htf_zone_label = htf_zone_direction(htf_df, htf_state, engine)
+    daily_ctx = daily_context_summary(daily_df, daily_state, engine)
 
     for tf, df, state in ((DTF, daily_df, daily_state), (HTF, htf_df, htf_state),
                            (LTF, ltf_df, ltf_state)):
@@ -1713,9 +1766,10 @@ def run_once(exchange, engine: SMCEngine, con):
                 candidate, daily_state, htf_state, ltf_state, engine)
             watch_chart_path = f"/tmp/smc_watch_{tf}_{int(time.time())}.png"
             render_setup_chart(df, state, candidate, watch_chart_path)
-            send_telegram_watch_photo(candidate, note, watch_chart_path)
+            send_telegram_watch_photo(candidate, note, watch_chart_path,
+                                       daily_context_text=daily_ctx["text"])
         else:
-            send_telegram_text(note)
+            send_telegram_text(f"{note}\n\n📅 {daily_ctx['text']}")
 
     setup = find_setup(SYMBOL, htf_df, htf_state, HTF, ltf_df, ltf_state, LTF, engine)
     if setup is None:
@@ -1736,8 +1790,8 @@ def run_once(exchange, engine: SMCEngine, con):
     chart_path = f"/tmp/smc_setup_{int(time.time())}.png"
     render_setup_chart(ltf_df, ltf_state, setup, chart_path)
     stats = get_performance_stats(con, symbol=setup.symbol)
-    tldr, analysis = get_ai_rationale(setup, stats)
-    send_telegram_alert(setup, tldr, analysis, chart_path)
+    tldr, analysis = get_ai_rationale(setup, stats, daily_context_text=daily_ctx["text"])
+    send_telegram_alert(setup, tldr, analysis, chart_path, daily_context_text=daily_ctx["text"])
     record_alert(con, setup)
 
 
