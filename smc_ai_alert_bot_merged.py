@@ -435,6 +435,18 @@ class TradeSetup:
     ltf_last_event: str
     current_price: float
     bar_time: pd.Timestamp
+    # --- OB + FVG confluence / grading (added for the A/B/B+ quality scoring) ---
+    ob_top: Optional[float] = None
+    ob_bottom: Optional[float] = None
+    fvg_top: Optional[float] = None
+    fvg_bottom: Optional[float] = None
+    has_fvg_confluence: bool = False
+    grade: str = "B"
+    grade_notes: list = field(default_factory=list)
+    # --- top-down flow context (added to fix zone-vs-trend gating + surface liquidity grabs) ---
+    htf_zone: str = "unknown"          # the 4h zone that GATED this setup's eligible direction
+    ltf_zone: str = "unknown"          # the LTF's own zone at time of entry (for context, not a gate)
+    has_liquidity_grab: bool = False   # opposite-direction BOS swept, then same-direction CHoCH confirmed
 
 
 def _rr(entry, stop, target) -> float:
@@ -457,6 +469,19 @@ def _nearest_swing_ob_beyond(engine: SMCEngine, state: SMCState, level: float,
     else:
         candidates = [ob for ob in obs if ob.bar_low < level]
         return max(candidates, key=lambda ob: ob.bar_low) if candidates else None
+
+
+def _ob_fvg_confluence(state: SMCState, ob: OrderBlock) -> Optional[FVG]:
+    """
+    An order block only counts as high-quality (grade-A-eligible) confluence if the
+    displacement move away from it actually left behind a same-direction FVG -- i.e.
+    the OB *created* an imbalance. Returns that FVG (any one, we don't need which),
+    or None if this OB has no FVG formed at/after it.
+    """
+    for fvg in state.fvgs:
+        if fvg.bias == ob.bias and fvg.bar_time >= ob.bar_time:
+            return fvg
+    return None
 
 
 def _nearest_unfilled_fvg_midpoint(engine: SMCEngine, state: SMCState,
@@ -549,7 +574,59 @@ def find_premium_discount_setup(symbol: str,
     return None
 
 
-# ------------------------------------------------------- secondary: OB/FVG continuation
+# ------------------------------------------------------- primary: OB + FVG confluence entry
+def htf_zone_direction(htf_df: pd.DataFrame, htf_state: SMCState, engine: SMCEngine):
+    """
+    THE top-down gate: what direction is even allowed to be considered for an entry,
+    given where the HTF (4h) currently sits on its own range.
+
+      - HTF in PREMIUM  -> only BEARISH candidates are eligible (sell premium)
+      - HTF in DISCOUNT -> only BULLISH candidates are eligible (buy discount)
+      - HTF in EQUILIBRIUM -> no directional green light yet, nothing is eligible
+
+    This replaces using htf_state.swing_trend as the gate. Trend and zone can and do
+    disagree -- e.g. price can be in a bullish 4h trend (last swing break was up) while
+    still trading inside 4h premium, in which case a retest of a *bullish* OB is not a
+    "buy the dip" entry, it's buying into the expensive part of the range. That was the
+    bug: candidates were being filtered by trend, so a bullish-OB retest during 4h
+    premium was wrongly treated as valid.
+
+    Returns (allowed_direction_or_None, htf_zone_label).
+    """
+    if htf_state.trailing_top is None or htf_state.trailing_bottom is None:
+        return None, "unknown"
+    pdz = engine.premium_discount_zones(htf_state)
+    price = htf_df["close"].iloc[-1]
+    zone = engine.classify_zone(price, pdz)
+    if zone == "premium":
+        return Bias.BEARISH, zone
+    if zone == "discount":
+        return Bias.BULLISH, zone
+    return None, zone
+
+
+def detect_liquidity_grab(state: SMCState, direction: int, lookback_events: int = 6) -> bool:
+    """
+    Flags the classic "sweep then reversal" pattern in the most recent swing structure
+    events: a BOS in the OPPOSITE direction (structure broke the "wrong" way -- often
+    just a stop-hunt through resting liquidity) followed later by a CHoCH in the SAME
+    direction as the intended trade (structure then confirms that break was fake and
+    the real move is the other way). This is exactly "bearish BOS was a liquidity grab,
+    confirmed by bullish CHoCH" from the trader's own description of the setup.
+    Only looks at the most recent `lookback_events` swing events so it isn't tripped by
+    an old, unrelated sweep from much earlier in the range.
+    """
+    recent = [e for e in state.events if e.scope == "swing"][-lookback_events:]
+    opposite = Bias.BEARISH if direction == Bias.BULLISH else Bias.BULLISH
+    swept = False
+    for ev in recent:
+        if ev.kind == "BOS" and ev.direction == opposite:
+            swept = True
+        elif ev.kind == "CHoCH" and ev.direction == direction and swept:
+            return True
+    return False
+
+
 def find_continuation_setup(symbol: str,
                              htf_df: pd.DataFrame, htf_state: SMCState, htf_tf: str,
                              ltf_df: pd.DataFrame, ltf_state: SMCState, ltf_tf: str,
@@ -558,42 +635,56 @@ def find_continuation_setup(symbol: str,
                              min_rr: float = 1.5,
                              max_rr: float = 6.0) -> Optional[TradeSetup]:
     """
-    Price returning into an unmitigated LTF order block / FVG that agrees with the HTF
-    swing trend direction. Kept as a secondary confirmation model -- trend continuation
-    rather than the fade strategy above.
+    Entry model: price returning into an unmitigated LTF order block, where the
+    OB's direction is the one the 4h ZONE currently permits (see htf_zone_direction)
+    -- premium only permits bearish OBs, discount only permits bullish OBs. This is
+    the top-down flow: 4h zone decides which side of the book you're even allowed to
+    be looking at before you drop down to the 15m for a trigger.
 
-    Target is the HTF trailing strong high/low, which "only ever extends" per the
-    structure engine -- early in a trending move that can sit very far from a tight
-    LTF stop, producing technically-correct but unrealistic R:R (30+). min_rr/max_rr
-    reject those rather than alert on a target that isn't a credible near-term level.
+      - Stop loss sits beyond the OB's own high/low (the swing point that formed
+        it) plus a small ATR buffer -- not an arbitrary distance.
+      - Take profit is the opposing point of interest: the HTF's most recent
+        trailing swing high/low (the next real level of interest, not a made-up
+        target).
+      - Confluence check: an OB that has a same-direction FVG formed at/after it
+        is the higher-quality trigger (this is what feeds the A/B grade later --
+        see grade_setup). OBs with confluence are preferred over ones without when
+        more than one candidate is active at once.
+      - Liquidity-grab tag: if the LTF's recent structure shows an opposite-direction
+        BOS (a sweep) followed by a same-direction CHoCH, that's flagged on the setup
+        as extra context -- structure itself is confirming the reversal, not just the
+        zone location.
     """
-    if htf_state.swing_trend == Bias.NONE:
-        return None
+    allowed_direction, htf_zone = htf_zone_direction(htf_df, htf_state, engine)
+    if allowed_direction is None:
+        return None  # 4h is in equilibrium -- no top-down green light yet
 
-    htf_bias = htf_state.swing_trend
     current_price = ltf_df["close"].iloc[-1]
     bar_time = ltf_df.index[-1]
     atr = engine._atr(ltf_df, engine.cfg.atr_period).iloc[-1]
 
-    candidates = []
-    for ob in engine.active_order_blocks(ltf_state, internal=True):
-        candidates.append(("order_block", ob.bar_low, ob.bar_high, ob.bias))
-    for ob in engine.active_order_blocks(ltf_state, internal=False):
-        candidates.append(("order_block", ob.bar_low, ob.bar_high, ob.bias))
-    for f in engine.active_fvgs(ltf_state):
-        candidates.append(("fvg", f.bottom, f.top, f.bias))
+    ltf_pdz = engine.premium_discount_zones(ltf_state) \
+        if ltf_state.trailing_top is not None and ltf_state.trailing_bottom is not None else None
+    ltf_zone = engine.classify_zone(current_price, ltf_pdz) if ltf_pdz else "unknown"
 
-    for kind, bottom, top, bias in candidates:
-        if bias != htf_bias or not (bottom <= current_price <= top):
-            continue
+    candidate_obs = (engine.active_order_blocks(ltf_state, internal=True) +
+                      engine.active_order_blocks(ltf_state, internal=False))
+    candidate_obs = [ob for ob in candidate_obs
+                      if ob.bias == allowed_direction and ob.bar_low <= current_price <= ob.bar_high]
+    # Prefer OB+FVG confluence (grade-A-eligible) candidates over bare OBs.
+    candidate_obs.sort(key=lambda ob: _ob_fvg_confluence(ltf_state, ob) is None)
 
-        direction = bias
+    for ob in candidate_obs:
+        direction = ob.bias
         entry = current_price
+        confluence_fvg = _ob_fvg_confluence(ltf_state, ob)
+        liquidity_grab = detect_liquidity_grab(ltf_state, direction)
+
         if direction == Bias.BULLISH:
-            stop_loss = bottom - sl_buffer_atr_mult * atr
+            stop_loss = ob.bar_low - sl_buffer_atr_mult * atr
             take_profit = htf_state.trailing_top
         else:
-            stop_loss = top + sl_buffer_atr_mult * atr
+            stop_loss = ob.bar_high + sl_buffer_atr_mult * atr
             take_profit = htf_state.trailing_bottom
 
         rr = _rr(entry, stop_loss, take_profit)
@@ -605,47 +696,179 @@ def find_continuation_setup(symbol: str,
 
         return TradeSetup(
             symbol=symbol, direction=direction, strategy="ob_continuation",
-            htf_timeframe=htf_tf, ltf_timeframe=ltf_tf, trigger_zone_kind=kind,
-            zone_top=top, zone_bottom=bottom, entry=entry, stop_loss=stop_loss,
-            take_profit=take_profit, rr=rr, htf_trend=htf_bias,
+            htf_timeframe=htf_tf, ltf_timeframe=ltf_tf, trigger_zone_kind="order_block",
+            zone_top=ob.bar_high, zone_bottom=ob.bar_low, entry=entry, stop_loss=stop_loss,
+            take_profit=take_profit, rr=rr, htf_trend=htf_state.swing_trend,
             ltf_last_event=last_event_desc, current_price=current_price, bar_time=bar_time,
+            ob_top=ob.bar_high, ob_bottom=ob.bar_low,
+            fvg_top=confluence_fvg.top if confluence_fvg else None,
+            fvg_bottom=confluence_fvg.bottom if confluence_fvg else None,
+            has_fvg_confluence=confluence_fvg is not None,
+            htf_zone=htf_zone, ltf_zone=ltf_zone, has_liquidity_grab=liquidity_grab,
         )
 
     return None
+
+
+def find_watch_candidate(symbol: str, df: pd.DataFrame, state: SMCState, tf: str,
+                          engine: SMCEngine, sl_buffer_atr_mult: float = 0.15,
+                          required_direction: Optional[int] = None
+                          ) -> Optional[TradeSetup]:
+    """
+    Single-timeframe, unfiltered version of the OB(+FVG) entry model, used only to
+    give the 'watching' message something concrete to show: is there an active OB
+    price is currently sitting inside, right now, on the timeframe that just
+    transitioned into premium/discount? No min/max R:R gate here (that's a
+    tradeability filter for confirmed alerts, not relevant to a heads-up preview).
+
+    required_direction: pass the PARENT timeframe's zone-permitted direction (e.g.
+    the 4h's htf_zone_direction) when previewing a child timeframe (15m). If this
+    tf's own zone would want the opposite direction, that candidate is skipped
+    entirely rather than shown -- a bullish reversal forming on the 15m while the 4h
+    is still in premium is exactly the "not ideal, top-down isn't aligned" case, so
+    it should not get a chart preview implying it's a live candidate. The caller
+    still gets the plain-text note either way, which is where that conflict gets
+    surfaced as context.
+
+    Returns None if no aligned OB is currently being retested -- caller falls back
+    to a plain text note in that case.
+    """
+    if state.trailing_top is None or state.trailing_bottom is None:
+        return None
+    pdz = engine.premium_discount_zones(state)
+    current_price = df["close"].iloc[-1]
+    zone = engine.classify_zone(current_price, pdz)
+    if zone == "equilibrium":
+        return None
+    # premium -> only interested in a short candidate; discount -> only a long one.
+    wanted_bias = Bias.BEARISH if zone == "premium" else Bias.BULLISH
+    if required_direction is not None and wanted_bias != required_direction:
+        return None  # this tf's own zone disagrees with the higher timeframe's gate
+
+    atr = engine._atr(df, engine.cfg.atr_period).iloc[-1]
+    candidate_obs = (engine.active_order_blocks(state, internal=True) +
+                      engine.active_order_blocks(state, internal=False))
+    candidate_obs = [ob for ob in candidate_obs
+                      if ob.bias == wanted_bias and ob.bar_low <= current_price <= ob.bar_high]
+    candidate_obs.sort(key=lambda ob: _ob_fvg_confluence(state, ob) is None)
+    if not candidate_obs:
+        return None
+
+    ob = candidate_obs[0]
+    confluence_fvg = _ob_fvg_confluence(state, ob)
+    direction = ob.bias
+    entry = current_price
+    liquidity_grab = detect_liquidity_grab(state, direction)
+    if direction == Bias.BULLISH:
+        stop_loss = ob.bar_low - sl_buffer_atr_mult * atr
+        take_profit = state.trailing_top
+    else:
+        stop_loss = ob.bar_high + sl_buffer_atr_mult * atr
+        take_profit = state.trailing_bottom
+
+    last_event = state.events[-1] if state.events else None
+    last_event_desc = f"{last_event.kind} {last_event.scope}" if last_event else "none"
+
+    return TradeSetup(
+        symbol=symbol, direction=direction, strategy="ob_continuation",
+        htf_timeframe=tf, ltf_timeframe=tf, trigger_zone_kind="order_block",
+        zone_top=ob.bar_high, zone_bottom=ob.bar_low, entry=entry, stop_loss=stop_loss,
+        take_profit=take_profit, rr=_rr(entry, stop_loss, take_profit), htf_trend=state.swing_trend,
+        ltf_last_event=last_event_desc, current_price=current_price, bar_time=df.index[-1],
+        ob_top=ob.bar_high, ob_bottom=ob.bar_low,
+        fvg_top=confluence_fvg.top if confluence_fvg else None,
+        fvg_bottom=confluence_fvg.bottom if confluence_fvg else None,
+        has_fvg_confluence=confluence_fvg is not None,
+        htf_zone=zone, ltf_zone=zone, has_liquidity_grab=liquidity_grab,
+    )
 
 
 def find_setup(symbol: str,
                htf_df: pd.DataFrame, htf_state: SMCState, htf_tf: str,
                ltf_df: pd.DataFrame, ltf_state: SMCState, ltf_tf: str,
                engine: SMCEngine) -> Optional[TradeSetup]:
-    """Tries the premium/discount fade first (the primary documented strategy);
-    falls back to OB/FVG continuation if no fade setup is active.
-
-    Top-down gate: whichever strategy fires, the resulting direction must agree
-    with the HTF zone. If the 4h range currently reads premium, only SHORT setups
-    are allowed to pass (longs -- including ones sourced from a 15m discount OB/FVG
-    in find_continuation_setup -- are vetoed). Symmetrically, HTF discount vetoes
-    shorts. HTF equilibrium imposes no veto either way.
     """
-    setup = find_premium_discount_setup(symbol, htf_df, htf_state, htf_tf,
-                                         ltf_df, ltf_state, ltf_tf, engine)
-    if setup is None:
-        setup = find_continuation_setup(symbol, htf_df, htf_state, htf_tf,
-                                         ltf_df, ltf_state, ltf_tf, engine)
-    if setup is None:
-        return None
+    Tries the OB (+ FVG confluence) entry model first -- this is the primary
+    strategy now, since entries should be anchored to an actual order block rather
+    than "price is somewhere in the premium/discount band." Falls back to the
+    premium/discount fade only if no OB retest is currently active.
 
-    if htf_state.trailing_top is not None and htf_state.trailing_bottom is not None:
-        htf_pdz = engine.premium_discount_zones(htf_state)
-        htf_zone = engine.classify_zone(htf_df["close"].iloc[-1], htf_pdz)
-        if htf_zone == "premium" and setup.direction == Bias.BULLISH:
-            log.info(f"Vetoed LONG setup ({setup.strategy}) -- HTF {htf_tf} is in premium.")
-            return None
-        if htf_zone == "discount" and setup.direction == Bias.BEARISH:
-            log.info(f"Vetoed SHORT setup ({setup.strategy}) -- HTF {htf_tf} is in discount.")
-            return None
-
+    Top-down flow: find_continuation_setup() is hard-gated by htf_zone_direction()
+    -- while the 4h is in premium, only bearish OB candidates are even considered;
+    while in discount, only bullish. A bullish OB retest during 4h premium (or vice
+    versa) will not surface here at all, no matter how it looks on the 15m alone.
+    Daily context and any remaining 15m-vs-4h nuance (e.g. 4h agrees but the 15m's
+    own zone doesn't) is layered on top by grade_setup() as a caution / grade
+    downgrade, since that's a "trade it smaller / be careful" situation rather than
+    a "don't show it at all" one.
+    """
+    setup = find_continuation_setup(symbol, htf_df, htf_state, htf_tf,
+                                     ltf_df, ltf_state, ltf_tf, engine)
+    if setup is None:
+        setup = find_premium_discount_setup(symbol, htf_df, htf_state, htf_tf,
+                                             ltf_df, ltf_state, ltf_tf, engine)
     return setup
+
+
+def grade_setup(setup: TradeSetup, daily_state: Optional[SMCState],
+                 htf_state: SMCState, ltf_state: SMCState,
+                 engine: SMCEngine) -> tuple[str, list[str]]:
+    """
+    Scores a setup A / B+ / B:
+
+      - Base quality comes from OB + FVG confluence (see _ob_fvg_confluence). A
+        setup can only ever reach grade A if the triggering OB actually left an FVG
+        behind it. No confluence caps the setup at B, regardless of alignment.
+
+      - On top of that, each of Daily / 4h / 15m is checked against the setup's
+        direction: does that timeframe's own premium/discount zone (or, if it's
+        currently in equilibrium, its swing trend) agree with going long/short here?
+          - 0 timeframes disagreeing + FVG confluence -> A ("everything aligns")
+          - 1 timeframe disagreeing -> B+, cautioned (e.g. "4h has a long setup
+            but is trading in premium" is exactly this case)
+          - 2+ timeframes disagreeing -> B, with an explicit conflict note
+
+    Returns (grade, notes) where notes are short human-readable strings used in the
+    Telegram caption and fed into the AI rationale prompt.
+    """
+    notes = []
+    conflicts = 0
+    direction = setup.direction
+    price = setup.current_price
+
+    def _check(label: str, state: Optional[SMCState]):
+        nonlocal conflicts
+        if state is None or state.trailing_top is None or state.trailing_bottom is None:
+            return
+        pdz = engine.premium_discount_zones(state)
+        zone = engine.classify_zone(price, pdz)
+        if zone == "premium" and direction == Bias.BULLISH:
+            conflicts += 1
+            notes.append(f"{label} is in premium -- caution on this long")
+        elif zone == "discount" and direction == Bias.BEARISH:
+            conflicts += 1
+            notes.append(f"{label} is in discount -- caution on this short")
+        elif state.swing_trend != Bias.NONE and state.swing_trend != direction:
+            conflicts += 1
+            notes.append(f"{label} swing trend disagrees with this setup's direction")
+
+    _check("Daily", daily_state)
+    _check("4h", htf_state)
+    _check("15m", ltf_state)
+
+    if not setup.has_fvg_confluence:
+        grade = "B"
+        notes.append("No FVG confluence behind this OB -- lower-quality trigger")
+    elif conflicts == 0:
+        grade = "A"
+    elif conflicts == 1:
+        grade = "B+"
+    else:
+        grade = "B"
+        notes.append("Multiple timeframes disagree -- lower-quality, cautious setup")
+
+    return grade, notes
+
 
 
 def find_standalone_setup(symbol: str, df: pd.DataFrame, state: SMCState, tf: str,
@@ -729,11 +952,20 @@ def render_setup_chart(df, state: SMCState, setup: TradeSetup, out_path: str,
         visible_hi = max(visible_hi, setup.take_profit + pad * 0.3)
     ax.set_ylim(visible_lo, visible_hi)
 
-    # highlight the trigger zone (order block / FVG)
+    # highlight the entry zone(s). For OB+FVG confluence setups, draw the OB and
+    # the FVG as two distinct bands so it's visually obvious whether this is an
+    # A-grade (both present) or B-grade (OB only, no FVG) trigger.
     zone_color = "#1848cc" if setup.direction == Bias.BULLISH else "#b22833"
-    ax.axhspan(setup.zone_bottom, setup.zone_top, xmin=0, xmax=1,
-               color=zone_color, alpha=0.25,
-               label=f"{setup.trigger_zone_kind.replace('_', ' ')} zone")
+    if setup.ob_top is not None and setup.ob_bottom is not None:
+        ax.axhspan(setup.ob_bottom, setup.ob_top, xmin=0, xmax=1,
+                   color=zone_color, alpha=0.22, label="order block")
+        if setup.fvg_top is not None and setup.fvg_bottom is not None:
+            ax.axhspan(setup.fvg_bottom, setup.fvg_top, xmin=0, xmax=1,
+                       color="#f2b705", alpha=0.30, label="FVG confluence")
+    else:
+        ax.axhspan(setup.zone_bottom, setup.zone_top, xmin=0, xmax=1,
+                   color=zone_color, alpha=0.25,
+                   label=f"{setup.trigger_zone_kind.replace('_', ' ')} zone")
 
     label_x = x1 + label_pad_bars * 0.15
 
@@ -765,8 +997,9 @@ def render_setup_chart(df, state: SMCState, setup: TradeSetup, out_path: str,
         )
 
     direction_word = "LONG" if setup.direction == Bias.BULLISH else "SHORT"
+    confluence_word = "OB+FVG confluence" if setup.has_fvg_confluence else "OB only, no FVG"
     ax.set_title(
-        f"{setup.symbol} — {direction_word} setup ({setup.trigger_zone_kind}) "
+        f"{setup.symbol} — {direction_word}  [Grade {setup.grade}]  ({confluence_word})\n"
         f"RR {setup.rr}  |  HTF {setup.htf_timeframe} trend: "
         f"{'UP' if setup.htf_trend == Bias.BULLISH else 'DOWN'}",
         fontsize=11.5, color="#e8eaed", pad=12,
@@ -787,6 +1020,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("smc_ai_alert_bot")
 
 SYMBOL = os.getenv("SMC_SYMBOL", "BTC/USDT:USDT")
+DTF = "1d"   # daily -- top of the 3-tier alignment check (Daily -> 4h -> 15m)
 HTF = "4h"
 LTF = "15m"
 POLL_SECONDS = int(os.getenv("SMC_POLL_SECONDS", "900"))
@@ -821,7 +1055,7 @@ def init_db():
     for col_def in [
         "strategy TEXT", "timeframe TEXT", "entry REAL", "stop_loss REAL",
         "take_profit REAL", "rr REAL", "status TEXT DEFAULT 'open'", "closed_at TEXT",
-        "exit_price REAL", "r_multiple REAL",
+        "exit_price REAL", "r_multiple REAL", "grade TEXT",
     ]:
         try:
             con.execute(f"ALTER TABLE sent_alerts ADD COLUMN {col_def}")
@@ -870,12 +1104,13 @@ def already_alerted(con, setup: TradeSetup) -> bool:
 def record_alert(con, setup: TradeSetup):
     con.execute(
         "INSERT INTO sent_alerts (symbol, direction, zone_kind, zone_top, zone_bottom, "
-        "bar_time, sent_at, strategy, timeframe, entry, stop_loss, take_profit, rr, status) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'open')",
+        "bar_time, sent_at, strategy, timeframe, entry, stop_loss, take_profit, rr, "
+        "status, grade) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?)",
         (setup.symbol, int(setup.direction), setup.trigger_zone_kind,
          setup.zone_top, setup.zone_bottom, str(setup.bar_time),
          datetime.now(timezone.utc).isoformat(), setup.strategy, setup.ltf_timeframe,
-         setup.entry, setup.stop_loss, setup.take_profit, setup.rr)
+         setup.entry, setup.stop_loss, setup.take_profit, setup.rr, setup.grade)
     )
     con.commit()
 
@@ -1077,32 +1312,46 @@ def get_ai_rationale(setup: TradeSetup, stats: dict = None) -> tuple[str, str]:
         strategy_desc = (
             f"a premium/discount fade: price is trading in the {setup.trigger_zone_kind} "
             f"zone of the {setup.htf_timeframe} swing range ({setup.zone_bottom:.1f}-{setup.zone_top:.1f}), "
-            f"targeting a reversion toward equilibrium (or the 50% level of a nearby unfilled FVG)"
+            f"targeting a reversion toward equilibrium (or the 50% level of a nearby unfilled FVG). "
+            f"This strategy isn't anchored to a specific order block, so it can't reach grade A."
         )
     else:
+        confluence_desc = (
+            "an FVG formed after it (the higher-quality OB+FVG confluence trigger)"
+            if setup.has_fvg_confluence else
+            "no FVG behind it (a bare OB retest -- lower-quality trigger)"
+        )
         strategy_desc = (
-            f"a trend continuation: price has returned into an unmitigated "
-            f"{setup.trigger_zone_kind.replace('_', ' ')} on the {setup.ltf_timeframe} chart "
-            f"that agrees with the {setup.htf_timeframe} swing trend"
+            f"an OB entry: price has returned into an unmitigated order block on the "
+            f"{setup.ltf_timeframe} chart that agrees with the {setup.htf_timeframe} swing "
+            f"trend, and that OB has {confluence_desc}. Stop sits beyond the OB's own "
+            f"high/low; target is the next opposing swing high/low."
         )
 
     stats_block = _format_stats_block(stats or {})
+    notes_block = "\n".join(f"- {n}" for n in setup.grade_notes) if setup.grade_notes else "- none"
 
     prompt = f"""You are annotating a systematic SMC (smart money concepts) trade alert
 for an experienced independent trader's own private Telegram feed. All the technical
-levels below were already computed algorithmically -- your job is to write it up.
-Do not add a confidence score, do not tell the reader whether to take the trade, do
-not add disclaimers -- they already know this is not financial advice.
+levels and the quality grade below were already computed algorithmically -- your job
+is to write it up. Do not add your own confidence score, do not tell the reader
+whether to take the trade, do not add disclaimers -- they already know this is not
+financial advice.
 
 Respond in EXACTLY this format, nothing before or after:
-TLDR: <one punchy sentence, under 20 words, direction + trigger + the key number that matters>
-ANALYSIS: <3-4 sentences on the structural logic in plain language, then one sentence
+TLDR: <one punchy sentence, under 20 words, direction + grade + the key number that matters>
+ANALYSIS: <3-4 sentences on the structural logic in plain language (mention the OB/FVG
+confluence status and any top-down alignment/conflict notes below), then one sentence
 on the main invalidation risk. If the performance history below is non-empty, close
 with one factual sentence on how this strategy type has been performing across past
 closed setups -- grounded in the actual numbers, no hype, no advice, just what the
 data shows so far.>
 
 Setup type: {strategy_desc}
+
+Grade: {setup.grade}
+Top-down alignment notes:
+{notes_block}
 
 Setup data:
 - Symbol: {setup.symbol}
@@ -1132,22 +1381,54 @@ Performance history for this strategy type so far (factual, from a trade log):
 
 def get_ai_watch_commentary(symbol: str, timeframe: str, zone: str,
                              htf_trend: int, current_price: float,
-                             pdz: "PremiumDiscountZones") -> str:
+                             pdz: "PremiumDiscountZones",
+                             htf_zone_label: str = "unknown",
+                             htf_allowed_direction: Optional[int] = None,
+                             liquidity_grab_note: str = "") -> str:
     """
     Short 'heads up' note for when price has just transitioned into a premium or
     discount zone on a given timeframe -- no confirmed trigger yet, just context
     that the bot is now watching this timeframe for a setup. Fires once per zone
     transition (see zone_transitioned), not on every poll.
+
+    Also carries the top-down story: what the 4h zone currently permits, and
+    whether this timeframe's own zone/structure (including any liquidity-grab
+    pattern just detected) agrees with it or not -- so a conflicting reversal on
+    the 15m still gets surfaced as context, clearly marked as not aligned yet,
+    rather than silently dropped or, worse, implied to be tradeable.
     """
+    zone_range = (f"{pdz.discount_top if zone == 'discount' else pdz.premium_bottom:.1f}-"
+                  f"{pdz.range_top if zone == 'premium' else pdz.range_bottom:.1f}")
+    htf_allowed_word = ("longs only" if htf_allowed_direction == Bias.BULLISH else
+                         "shorts only" if htf_allowed_direction == Bias.BEARISH else
+                         "no directional green light (4h in equilibrium)")
+    aligned = (timeframe != LTF or htf_allowed_direction is None or
+               (zone == "discount" and htf_allowed_direction == Bias.BULLISH) or
+               (zone == "premium" and htf_allowed_direction == Bias.BEARISH))
+
     if not ANTHROPIC_API_KEY:
-        return f"👀 Watching the {timeframe} chart: price just entered the {zone} zone " \
-               f"({pdz.discount_top if zone == 'discount' else pdz.premium_bottom:.1f}-" \
-               f"{pdz.range_top if zone == 'premium' else pdz.range_bottom:.1f}). " \
-               f"(no ANTHROPIC_API_KEY set -- skipping AI-written note)"
+        base = f"👀 Watching the {timeframe} chart: price just entered the {zone} zone ({zone_range})."
+        if timeframe == LTF:
+            base += f" 4h currently permits {htf_allowed_word}."
+            if not aligned:
+                base += " NOT aligned with the 4h right now."
+        if liquidity_grab_note:
+            base += f" {liquidity_grab_note}."
+        return base + " (no ANTHROPIC_API_KEY set -- skipping AI-written note)"
 
     scope_word = "swing" if timeframe not in ("15m", "5m", "1m") else "intraday"
     trend_word = "bullish" if htf_trend == Bias.BULLISH else (
         "bearish" if htf_trend == Bias.BEARISH else "undetermined")
+
+    top_down_block = ""
+    if timeframe == LTF:
+        top_down_block = f"""
+Top-down context (this is the key thing to convey):
+- 4h zone: {htf_zone_label} -> 4h currently permits {htf_allowed_word}
+- This 15m zone: {zone}
+- Aligned with the 4h right now: {"YES" if aligned else "NO -- flag this clearly"}
+{f"- Liquidity-grab pattern just detected on the 15m: {liquidity_grab_note}" if liquidity_grab_note else ""}
+"""
 
     prompt = f"""You are writing a short heads-up note for an experienced independent
 trader's private Telegram feed. Price on the {timeframe} chart has just transitioned
@@ -1156,21 +1437,22 @@ just context that the systematic bot is now actively watching this timeframe for
 possible setup. Do not recommend a trade, do not add a confidence score, do not add
 disclaimers -- they already know this is not financial advice.
 
-Respond with ONE short sentence (under 25 words) in this spirit: "Watching the
-{timeframe} {scope_word}: price is in the {zone} zone, watching for a [premium-fade
-short / discount-fade long / continuation] confirmation."
+{"If a liquidity-grab pattern is present, mention it plainly -- it's interesting " if liquidity_grab_note else ""}{"structural context even when (especially when) it conflicts with the 4h gate; " if liquidity_grab_note else ""}{"say clearly that it is NOT tradeable yet if the top-down alignment says NO." if liquidity_grab_note else ""}
+
+Respond with ONE to TWO short sentences (under 40 words total). If this is the 15m
+and it is NOT aligned with the 4h, make that explicit (e.g. "...but 4h is still in
+premium, shorts only up here -- not aligned yet").
 
 Data:
 - Symbol: {symbol}
 - Timeframe: {timeframe} ({scope_word})
 - Zone: {zone}
-- Zone range: {pdz.discount_top if zone == 'discount' else pdz.premium_bottom:.1f} to \
-{pdz.range_top if zone == 'premium' else pdz.range_bottom:.1f}
+- Zone range: {zone_range}
 - Current price: {current_price:.1f}
 - Broader swing trend on this same range: {trend_word}
-"""
+{top_down_block}"""
     try:
-        return _call_claude(prompt, max_tokens=100).strip()
+        return _call_claude(prompt, max_tokens=140).strip()
     except Exception as e:
         log.warning(f"AI watch commentary call failed: {e}")
         return f"👀 Watching the {timeframe} chart: price just entered the {zone} zone."
@@ -1252,18 +1534,22 @@ def send_telegram_alert(setup: TradeSetup, tldr: str, analysis: str, chart_path:
     direction_word = "🟢 LONG" if setup.direction == Bias.BULLISH else "🔴 SHORT"
     strategy_label = "Premium/Discount Fade" if setup.strategy == "premium_discount_fade" \
         else "OB/FVG Continuation"
+    grade_emoji = {"A": "🅰️", "B+": "🅱️➕", "B": "🅱️"}.get(setup.grade, "")
+    confluence_word = "OB+FVG confluence ✅" if setup.has_fvg_confluence else "OB only, no FVG ⚠️"
+    notes_line = ("\n".join(f"⚠️ {n}" for n in setup.grade_notes) + "\n\n") if setup.grade_notes else ""
 
     # Levels + TLDR go on the photo caption -- kept short and predictable (TLDR is
     # capped by prompt to ~20 words) so it never risks tripping the 1024-char
     # sendPhoto caption limit, regardless of how long the full analysis runs.
     caption = (
-        f"*{setup.symbol}* — {direction_word} setup ({strategy_label})\n"
+        f"*{setup.symbol}* — {direction_word}  *[Grade {setup.grade}]* {grade_emoji} ({strategy_label})\n"
         f"HTF {setup.htf_timeframe} bias: {'UP' if setup.htf_trend == Bias.BULLISH else 'DOWN'}  "
-        f"| Zone: {setup.trigger_zone_kind.replace('_', ' ')}\n\n"
+        f"| Trigger: {setup.trigger_zone_kind.replace('_', ' ')} -- {confluence_word}\n\n"
         f"Entry: `{setup.entry:,.1f}`\n"
         f"Stop: `{setup.stop_loss:,.1f}`\n"
         f"Target: `{setup.take_profit:,.1f}`\n"
         f"R:R: `{setup.rr}`\n\n"
+        f"{notes_line}"
         f"_TLDR: {tldr}_"
     )
     caption = _truncate(caption, TELEGRAM_CAPTION_LIMIT)
@@ -1285,6 +1571,43 @@ def send_telegram_alert(setup: TradeSetup, tldr: str, analysis: str, chart_path:
     # truncated defensively in case Claude ever returns something unusually long.
     if analysis:
         send_telegram_text(analysis)
+
+
+def send_telegram_watch_photo(setup: TradeSetup, note: str, chart_path: str):
+    """
+    Same visual as a confirmed setup alert (OB/FVG bands, entry/SL/TP lines, grade),
+    but explicitly labeled WATCHING so it reads as a heads-up preview -- not a signal
+    to act on -- and is never written to sent_alerts / outcome tracking.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured -- printing watch alert instead:")
+        print(note)
+        return
+
+    direction_word = "possible LONG" if setup.direction == Bias.BULLISH else "possible SHORT"
+    caption = (
+        f"👀 *WATCHING* — *{setup.symbol}* {setup.htf_timeframe} — {direction_word}  "
+        f"[Grade preview: {setup.grade}]\n"
+        f"{'OB+FVG confluence' if setup.has_fvg_confluence else 'OB only, no FVG yet'}\n\n"
+        f"Entry: `{setup.entry:,.1f}`\n"
+        f"Stop: `{setup.stop_loss:,.1f}`\n"
+        f"Target: `{setup.take_profit:,.1f}`\n\n"
+        f"_{note}_"
+    )
+    caption = _truncate(caption, TELEGRAM_CAPTION_LIMIT)
+
+    photo_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    with open(chart_path, "rb") as f:
+        r = requests.post(
+            photo_url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "Markdown"},
+            files={"photo": f},
+            timeout=30,
+        )
+    if not r.ok:
+        log.error(f"Telegram watch photo send failed: {r.status_code} {r.text}")
+    else:
+        log.info("Telegram watch photo sent")
 
 
 def send_telegram_outcome(closed: dict, commentary: str):
@@ -1339,15 +1662,24 @@ def run_once(exchange, engine: SMCEngine, con):
             send_performance_recap(stats)
 
     # 2. Look for a new setup.
+    daily_df = fetch_ohlcv(exchange, SYMBOL, DTF)
     htf_df = fetch_ohlcv(exchange, SYMBOL, HTF)
     ltf_df = fetch_ohlcv(exchange, SYMBOL, LTF)
 
+    daily_state = engine.run(daily_df)
     htf_state = engine.run(htf_df)
     ltf_state = engine.run(ltf_df)
 
     # 2a. "Watching" alerts -- fire once per zone transition on each timeframe
-    # independently (4h swing and 15m intraday), before any trigger has confirmed.
-    for tf, df, state in ((HTF, htf_df, htf_state), (LTF, ltf_df, ltf_state)):
+    # independently (daily swing, 4h swing, and 15m intraday), before any trigger
+    # has confirmed. The 4h's zone-permitted direction (see htf_zone_direction) is
+    # computed once up front and passed down to the 15m preview so a bullish
+    # candidate never gets shown while the 4h is in premium (or vice versa) --
+    # matching the same top-down gate confirmed setups now use.
+    htf_allowed_direction, htf_zone_label = htf_zone_direction(htf_df, htf_state, engine)
+
+    for tf, df, state in ((DTF, daily_df, daily_state), (HTF, htf_df, htf_state),
+                           (LTF, ltf_df, ltf_state)):
         if state.trailing_top is None or state.trailing_bottom is None:
             continue
         pdz = engine.premium_discount_zones(state)
@@ -1355,14 +1687,46 @@ def run_once(exchange, engine: SMCEngine, con):
         zone = engine.classify_zone(price, pdz)
         if zone == "equilibrium":
             continue  # only premium/discount are worth a watch note
-        if zone_transitioned(con, SYMBOL, tf, zone):
-            note = get_ai_watch_commentary(SYMBOL, tf, zone, state.swing_trend, price, pdz)
+        if not zone_transitioned(con, SYMBOL, tf, zone):
+            continue
+
+        # On the 15m, also check for a liquidity-grab pattern in EITHER direction so
+        # the note can mention it even when it conflicts with the 4h gate (e.g. "15m
+        # showed a bearish sweep + bullish CHoCH, but 4h is still premium -- shorts
+        # only up here, so this reversal isn't tradeable yet").
+        lg_note = ""
+        if tf == LTF:
+            if detect_liquidity_grab(state, Bias.BULLISH):
+                lg_note = "15m structure just showed a bearish BOS (sweep) followed by a bullish CHoCH"
+            elif detect_liquidity_grab(state, Bias.BEARISH):
+                lg_note = "15m structure just showed a bullish BOS (sweep) followed by a bearish CHoCH"
+
+        required_direction = htf_allowed_direction if tf == LTF else None
+        note = get_ai_watch_commentary(SYMBOL, tf, zone, state.swing_trend, price, pdz,
+                                        htf_zone_label=htf_zone_label,
+                                        htf_allowed_direction=htf_allowed_direction,
+                                        liquidity_grab_note=lg_note)
+        candidate = find_watch_candidate(SYMBOL, df, state, tf, engine,
+                                          required_direction=required_direction)
+        if candidate is not None:
+            candidate.grade, candidate.grade_notes = grade_setup(
+                candidate, daily_state, htf_state, ltf_state, engine)
+            watch_chart_path = f"/tmp/smc_watch_{tf}_{int(time.time())}.png"
+            render_setup_chart(df, state, candidate, watch_chart_path)
+            send_telegram_watch_photo(candidate, note, watch_chart_path)
+        else:
             send_telegram_text(note)
 
     setup = find_setup(SYMBOL, htf_df, htf_state, HTF, ltf_df, ltf_state, LTF, engine)
     if setup is None:
         log.info("No setup right now.")
         return
+
+    # 2b. Grade the setup: OB+FVG confluence (base A/B) x Daily->4h->15m alignment
+    # (A requires full agreement, one conflicting timeframe caps it at B+, two or
+    # more caps it at B). Setups are no longer vetoed for HTF-zone conflicts --
+    # they're downgraded and captioned with why instead.
+    setup.grade, setup.grade_notes = grade_setup(setup, daily_state, htf_state, ltf_state, engine)
 
     if already_alerted(con, setup):
         log.info("Setup already alerted, skipping.")
@@ -1382,7 +1746,7 @@ def main():
     engine = SMCEngine(SMCConfig(swing_length=50, internal_length=5))
     con = init_db()
 
-    log.info(f"Starting smc_ai_alert_bot for {SYMBOL} (HTF={HTF}, LTF={LTF}, "
+    log.info(f"Starting smc_ai_alert_bot for {SYMBOL} (DTF={DTF}, HTF={HTF}, LTF={LTF}, "
              f"poll={POLL_SECONDS}s)")
     while True:
         try:
