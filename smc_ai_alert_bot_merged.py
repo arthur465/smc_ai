@@ -754,45 +754,66 @@ def find_continuation_setup(symbol: str,
 
 def find_watch_candidate(symbol: str, df: pd.DataFrame, state: SMCState, tf: str,
                           engine: SMCEngine, sl_buffer_atr_mult: float = 0.15,
-                          required_direction: Optional[int] = None
+                          required_direction: Optional[int] = None,
+                          require_retest: bool = True
                           ) -> Optional[TradeSetup]:
     """
-    Single-timeframe, unfiltered version of the OB(+FVG) entry model, used only to
-    give the 'watching' message something concrete to show: is there an active OB
-    price is currently sitting inside, right now, on the timeframe that just
-    transitioned into premium/discount? No min/max R:R gate here (that's a
-    tradeability filter for confirmed alerts, not relevant to a heads-up preview).
+    Single-timeframe, unfiltered version of the OB(+FVG) entry model, used to give
+    a 'watching' message something concrete to show.
 
     required_direction: pass the PARENT timeframe's zone-permitted direction (e.g.
     the 4h's htf_zone_direction) when previewing a child timeframe (15m). If this
     tf's own zone would want the opposite direction, that candidate is skipped
     entirely rather than shown -- a bullish reversal forming on the 15m while the 4h
     is still in premium is exactly the "not ideal, top-down isn't aligned" case, so
-    it should not get a chart preview implying it's a live candidate. The caller
-    still gets the plain-text note either way, which is where that conflict gets
-    surfaced as context.
+    it should not get a chart preview implying it's a live candidate.
 
-    Returns None if no aligned OB is currently being retested -- caller falls back
-    to a plain text note in that case.
+    require_retest: True (default) -- price must currently be sitting inside the OB
+    (used for the zone-transition watch alerts, where "is there something live right
+    now" is the question). False -- returns the NEAREST unmitigated OB in the
+    permitted direction even if price hasn't reached it yet (used for the startup
+    status report's "where to watch for an entry" -- you want to know the level is
+    there before price gets to it, not only once it's already retesting).
+
+    Returns None if no aligned OB is found -- caller falls back to a plain text note.
     """
     if state.trailing_top is None or state.trailing_bottom is None:
         return None
     pdz = engine.premium_discount_zones(state)
     current_price = df["close"].iloc[-1]
     zone = engine.classify_zone(current_price, pdz)
-    if zone == "equilibrium":
-        return None
-    # premium -> only interested in a short candidate; discount -> only a long one.
-    wanted_bias = Bias.BEARISH if zone == "premium" else Bias.BULLISH
-    if required_direction is not None and wanted_bias != required_direction:
-        return None  # this tf's own zone disagrees with the higher timeframe's gate
+
+    if required_direction is not None:
+        wanted_bias = required_direction
+        if require_retest:
+            # Live-alert case: this tf's own zone must actually agree with the
+            # parent's permitted direction, otherwise we'd be implying a candidate
+            # is "live" when the tf itself isn't even in the right zone yet.
+            own_zone_bias = Bias.BEARISH if zone == "premium" else (
+                Bias.BULLISH if zone == "discount" else None)
+            if own_zone_bias != wanted_bias:
+                return None
+        # else (require_retest=False): "where to watch ahead" lookup -- deliberately
+        # ignores this tf's own zone and just finds the nearest OB matching the
+        # parent-permitted direction, since the point is to flag the level before
+        # price (and this tf's own zone reading) gets there.
+    else:
+        if zone == "equilibrium":
+            return None
+        wanted_bias = Bias.BEARISH if zone == "premium" else Bias.BULLISH
 
     atr = engine._atr(df, engine.cfg.atr_period).iloc[-1]
     candidate_obs = (engine.active_order_blocks(state, internal=True) +
                       engine.active_order_blocks(state, internal=False))
-    candidate_obs = [ob for ob in candidate_obs
-                      if ob.bias == wanted_bias and ob.bar_low <= current_price <= ob.bar_high]
-    candidate_obs.sort(key=lambda ob: _ob_fvg_confluence(state, ob) is None)
+    candidate_obs = [ob for ob in candidate_obs if ob.bias == wanted_bias]
+    if require_retest:
+        candidate_obs = [ob for ob in candidate_obs if ob.bar_low <= current_price <= ob.bar_high]
+        candidate_obs.sort(key=lambda ob: _ob_fvg_confluence(state, ob) is None)
+    else:
+        candidate_obs.sort(key=lambda ob: (
+            min(abs(current_price - ob.bar_high), abs(current_price - ob.bar_low)),
+            _ob_fvg_confluence(state, ob) is None,
+        ))
     if not candidate_obs:
         return None
 
@@ -1698,6 +1719,99 @@ def send_performance_recap(stats: dict):
 
 # ---------------------------------------------------------------------------- core
 RECAP_EVERY_N_CLOSED = int(os.getenv("SMC_RECAP_EVERY_N_CLOSED", "5"))
+
+
+def _fmt_ob_watch_line(label: str, ob_setup: Optional[TradeSetup], current_price: float) -> str:
+    """Formats one 'here's the level to watch' line for the status report."""
+    if ob_setup is None:
+        return f"{label}: no active order block in the permitted direction right now -- nothing to watch yet."
+    dir_word = "BULLISH" if ob_setup.direction == Bias.BULLISH else "BEARISH"
+    live = ob_setup.ob_bottom <= current_price <= ob_setup.ob_top
+    status = "🔴 PRICE IS INSIDE IT RIGHT NOW" if live else "watching for price to reach it"
+    conf = "FVG confluence ✅ (grade-A eligible)" if ob_setup.has_fvg_confluence else "no FVG yet ⚠️ (capped at grade B)"
+    lg = " | liquidity grab confirmed 🎣" if ob_setup.has_liquidity_grab else ""
+    return (f"{label}: {dir_word} OB at `{ob_setup.ob_bottom:,.1f}-{ob_setup.ob_top:,.1f}` "
+            f"({conf}{lg}) -- {status}. SL `{ob_setup.stop_loss:,.1f}` / TP `{ob_setup.take_profit:,.1f}`")
+
+
+def build_status_report(daily_df, daily_state, htf_df, htf_state, ltf_df, ltf_state,
+                         engine: SMCEngine) -> str:
+    """
+    Full current-state snapshot across Daily / 4h / 15m, independent of zone
+    transitions or a confirmed setup firing -- this is what should print the moment
+    the bot loads, so there's never a silent gap where the trader has no idea what
+    the bot currently thinks, same read they'd get glancing at the LuxAlgo premium/
+    discount overlay on their own chart.
+    """
+    lines = ["📊 *Current SMC Status*"]
+
+    # --- Daily ---
+    daily_ctx = daily_context_summary(daily_df, daily_state, engine)
+    lines.append(f"\n*Daily* -- {daily_ctx['text']}")
+
+    # --- 4h ---
+    htf_allowed, htf_zone = htf_zone_direction(htf_df, htf_state, engine)
+    htf_word = ("LONGS only" if htf_allowed == Bias.BULLISH else
+                "SHORTS only" if htf_allowed == Bias.BEARISH else
+                "no directional bias yet (equilibrium)")
+    lines.append(f"\n*4h* -- in *{htf_zone}* zone -> permits {htf_word}")
+    htf_price = htf_df["close"].iloc[-1]
+    htf_candidate = find_watch_candidate(SYMBOL, htf_df, htf_state, HTF, engine,
+                                          required_direction=htf_allowed, require_retest=False)
+    lines.append(_fmt_ob_watch_line("  4h level to watch", htf_candidate, htf_price))
+
+    # --- 15m ---
+    ltf_pdz = engine.premium_discount_zones(ltf_state) \
+        if ltf_state.trailing_top is not None and ltf_state.trailing_bottom is not None else None
+    ltf_price = ltf_df["close"].iloc[-1]
+    ltf_zone = engine.classify_zone(ltf_price, ltf_pdz) if ltf_pdz else "unknown"
+    own_ltf_bias = Bias.BEARISH if ltf_zone == "premium" else (Bias.BULLISH if ltf_zone == "discount" else None)
+    aligned = htf_allowed is not None and own_ltf_bias == htf_allowed
+    align_word = ("✅ ALIGNED with the 4h" if aligned else
+                  "⚠️ NOT aligned with the 4h yet" if htf_allowed is not None else
+                  "4h has no directional bias yet")
+    lines.append(f"\n*15m* -- in *{ltf_zone}* zone -- {align_word}")
+    ltf_candidate = find_watch_candidate(SYMBOL, ltf_df, ltf_state, LTF, engine,
+                                          required_direction=htf_allowed, require_retest=False)
+    lines.append(_fmt_ob_watch_line("  15m level to watch", ltf_candidate, ltf_price))
+
+    if detect_liquidity_grab(ltf_state, Bias.BULLISH):
+        lines.append("\n🎣 15m structure recently showed a bearish sweep followed by a bullish CHoCH "
+                      "(possible liquidity grab, reversal context).")
+    elif detect_liquidity_grab(ltf_state, Bias.BEARISH):
+        lines.append("\n🎣 15m structure recently showed a bullish sweep followed by a bearish CHoCH "
+                      "(possible liquidity grab, reversal context).")
+
+    return "\n".join(lines)
+
+
+def send_startup_report(exchange, engine: SMCEngine):
+    """
+    Runs once when the bot process starts (before entering the polling loop) --
+    fetches Daily/4h/15m fresh, builds the full status report, and sends it plus a
+    chart snapshot for whichever timeframe (4h or 15m) currently has the most
+    relevant level to watch. This is the "current state of the analysis" the bot
+    was previously silent on until the next zone transition or confirmed setup.
+    """
+    daily_df = fetch_ohlcv(exchange, SYMBOL, DTF)
+    htf_df = fetch_ohlcv(exchange, SYMBOL, HTF)
+    ltf_df = fetch_ohlcv(exchange, SYMBOL, LTF)
+    daily_state = engine.run(daily_df)
+    htf_state = engine.run(htf_df)
+    ltf_state = engine.run(ltf_df)
+
+    report = build_status_report(daily_df, daily_state, htf_df, htf_state,
+                                  ltf_df, ltf_state, engine)
+    send_telegram_text(f"🟢 *Bot started* -- here's the current read.\n\n{report}")
+
+    htf_allowed, _ = htf_zone_direction(htf_df, htf_state, engine)
+    ltf_candidate = find_watch_candidate(SYMBOL, ltf_df, ltf_state, LTF, engine,
+                                          required_direction=htf_allowed, require_retest=False)
+    if ltf_candidate is not None:
+        chart_path = f"/tmp/smc_startup_{LTF}_{int(time.time())}.png"
+        render_setup_chart(ltf_df, ltf_state, ltf_candidate, chart_path)
+        send_telegram_watch_photo(ltf_candidate, "Nearest 15m level to watch, per the current daily/4h read.",
+                                   chart_path)
 
 
 def run_once(exchange, engine: SMCEngine, con):
