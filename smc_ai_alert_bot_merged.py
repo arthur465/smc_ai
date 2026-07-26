@@ -149,12 +149,14 @@ def compute_structure(df, length, fib_level=0.71):
         bottom is the Weak Low (formed on the same push, expected to get
         swept before a real reversal); a bullish trend flips that — Strong
         Low, Weak High.
-      - a 0.71 fib anchored to the dealing range, measured FROM the weak side
-        TOWARD the strong side (71% of the way back). In a downtrend that
-        lands high in the range (premium, short entry); in an uptrend it
-        lands low in the range (discount, long entry). Recomputed fresh from
-        the live top/bottom every call, so it re-anchors automatically
-        whenever the range expands or resets.
+      - two fib levels anchored to the dealing range: fib_short sits `fib_level`
+        (0.71) of the way up from the bottom (premium-side sell zone),
+        fib_long sits `fib_level` of the way down from the top (discount-side
+        buy zone). These prices don't depend on bias — bias only labels which
+        one is the with-trend trade and which is the counter-trend fade, so
+        both directions are always available. Recomputed fresh from the live
+        top/bottom every call, so they re-anchor automatically whenever the
+        range expands or resets.
     Returns the state as of the most recent bar.
     """
     n = len(df)
@@ -201,20 +203,39 @@ def compute_structure(df, length, fib_level=0.71):
 
     if bias == "BEARISH":
         top_label, bottom_label = "Strong High", "Weak Low"
-        weak_price, strong_price = trailing_bottom, trailing_top
     elif bias == "BULLISH":
         top_label, bottom_label = "Weak High", "Strong Low"
-        weak_price, strong_price = trailing_top, trailing_bottom
     else:
         top_label, bottom_label = "High", "Low"
-        weak_price = strong_price = None
 
-    fib_071 = (weak_price + fib_level * (strong_price - weak_price)) if bias else (trailing_top + trailing_bottom) / 2
+    # The two fib prices are always the same two numbers regardless of bias —
+    # fib_short sits `fib_level` of the way up from bottom (premium-side, the
+    # sell zone), fib_long sits `fib_level` of the way down from top
+    # (discount-side, the buy zone). Bias doesn't move these prices, it only
+    # decides which one is "with the trend" vs "fading it": in a downtrend
+    # fib_short is the with-trend (short) entry and fib_long is the counter-
+    # trend (long) entry; an uptrend flips that. Both are always returned so
+    # you can trade either direction, not just the one bias favors.
+    rng = trailing_top - trailing_bottom
+    fib_short = trailing_bottom + fib_level * rng        # premium-side / sell zone
+    fib_long = trailing_bottom + (1 - fib_level) * rng   # discount-side / buy zone
+
+    if bias == "BEARISH":
+        with_trend_dir, with_trend_fib = "SHORT", fib_short
+        counter_dir, counter_fib = "LONG", fib_long
+    elif bias == "BULLISH":
+        with_trend_dir, with_trend_fib = "LONG", fib_long
+        counter_dir, counter_fib = "SHORT", fib_short
+    else:
+        with_trend_dir = with_trend_fib = counter_dir = counter_fib = None
 
     return {
         "top": trailing_top, "top_time": pd.Timestamp(top_time), "top_label": top_label,
         "bottom": trailing_bottom, "bottom_time": pd.Timestamp(bottom_time), "bottom_label": bottom_label,
-        "bias": bias, "fib_071": float(fib_071),
+        "bias": bias,
+        "fib_long": float(fib_long), "fib_short": float(fib_short),
+        "with_trend_dir": with_trend_dir, "with_trend_fib": with_trend_fib,
+        "counter_dir": counter_dir, "counter_fib": counter_fib,
     }
 
 
@@ -340,11 +361,22 @@ def make_chart(df, zone_range, bull_ob, bear_ob, title, path):
     ax.text(x_right, bottom, f" {zone_range['bottom_label']} {bottom:.2f}", va="top", ha="right",
             fontsize=8, color="darkgreen")
 
-    fib = zone_range.get("fib_071")
-    if fib is not None:
-        ax.axhline(fib, color="gold", linestyle="-", linewidth=1.6, zorder=5)
-        ax.text(0, fib, f" Fib .71 — {fib:.2f} ", va="center", ha="left",
-                fontsize=8, fontweight="bold", color="darkgoldenrod",
+    fib_long, fib_short = zone_range.get("fib_long"), zone_range.get("fib_short")
+    if fib_long is not None:
+        emphasize = zone_range.get("with_trend_dir") == "LONG"
+        ax.axhline(fib_long, color="lime", linestyle="-" if emphasize else "--",
+                   linewidth=1.8 if emphasize else 1.1, zorder=5)
+        tag = " (with-trend)" if emphasize else " (counter-trend)" if zone_range.get("counter_dir") == "LONG" else ""
+        ax.text(0, fib_long, f" Fib .71 Long{tag} — {fib_long:.2f} ", va="center", ha="left",
+                fontsize=8, fontweight="bold" if emphasize else "normal", color="darkgreen",
+                backgroundcolor="white")
+    if fib_short is not None:
+        emphasize = zone_range.get("with_trend_dir") == "SHORT"
+        ax.axhline(fib_short, color="magenta", linestyle="-" if emphasize else "--",
+                   linewidth=1.8 if emphasize else 1.1, zorder=5)
+        tag = " (with-trend)" if emphasize else " (counter-trend)" if zone_range.get("counter_dir") == "SHORT" else ""
+        ax.text(0, fib_short, f" Fib .71 Short{tag} — {fib_short:.2f} ", va="center", ha="left",
+                fontsize=8, fontweight="bold" if emphasize else "normal", color="purple",
                 backgroundcolor="white")
 
     if bull_ob:
@@ -378,16 +410,22 @@ def analyze():
     aligned = d_zone in ("Premium", "Discount") and d_zone == h_zone
     if aligned:
         bias = "LONG" if d_zone == "Discount" else "SHORT"
-        watch_fib = h_range["fib_071"]
+        counter_bias = "SHORT" if bias == "LONG" else "LONG"
+        watch_fib = h_range["fib_long"] if bias == "LONG" else h_range["fib_short"]
+        counter_fib = h_range["fib_short"] if bias == "LONG" else h_range["fib_long"]
         watch_ob = h_bull_ob if bias == "LONG" else h_bear_ob
+        counter_ob = h_bear_ob if bias == "LONG" else h_bull_ob
     else:
-        bias, watch_fib, watch_ob = "NO ALIGNMENT", None, None
+        bias, counter_bias = "NO ALIGNMENT", None
+        watch_fib = counter_fib = watch_ob = counter_ob = None
 
     data = {
         "symbol": SYMBOL, "price": price,
         "daily": {"zone": d_zone, "pct": d_pct, **d_range, "bull_ob": d_bull_ob, "bear_ob": d_bear_ob},
         "h4": {"zone": h_zone, "pct": h_pct, **h_range, "bull_ob": h_bull_ob, "bear_ob": h_bear_ob},
-        "aligned": aligned, "bias": bias, "watch_fib": watch_fib, "watch_ob": watch_ob,
+        "aligned": aligned,
+        "bias": bias, "watch_fib": watch_fib, "watch_ob": watch_ob,
+        "counter_bias": counter_bias, "counter_fib": counter_fib, "counter_ob": counter_ob,
     }
     return data, daily, h4
 
@@ -406,12 +444,16 @@ def fallback_summary(d):
         f"{d['daily']['top_label']} {d['daily']['top']:.2f} / {d['daily']['bottom_label']} {d['daily']['bottom']:.2f}",
         f"4H: {d['h4']['zone']} ({d['h4']['pct']}% of range) — "
         f"{d['h4']['top_label']} {d['h4']['top']:.2f} / {d['h4']['bottom_label']} {d['h4']['bottom']:.2f}",
+        "",
+        f"LONG setup — 4H fib .71 buy zone: {d['h4']['fib_long']:.2f} | 4H bullish OB: {fmt_ob(d['h4']['bull_ob'])}",
+        f"SHORT setup — 4H fib .71 sell zone: {d['h4']['fib_short']:.2f} | 4H bearish OB: {fmt_ob(d['h4']['bear_ob'])}",
     ]
     if d["aligned"]:
-        lines.append(f"Aligned -> bias {d['bias']}. 4H fib .71 entry: {d['watch_fib']:.2f}. "
-                     f"4H OB confluence: {fmt_ob(d['watch_ob'])}")
+        lines.append(f"\nAligned -> with-trend bias is {d['bias']} at {d['watch_fib']:.2f}. "
+                     f"If you want to fade it instead, the counter-trend {d['counter_bias']} zone is {d['counter_fib']:.2f}.")
     else:
-        lines.append("Not aligned — wait for daily and 4H to agree before sizing up.")
+        lines.append("\nDaily and 4H aren't in the same zone right now, so there's no with-trend "
+                     "alignment — either setup above would be counter to one of the two timeframes.")
     return "\n".join(lines)
 
 
@@ -419,29 +461,32 @@ def llm_summary(d):
     if not (ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY):
         return fallback_summary(d)
 
-    prompt = f"""Summarize this SMC premium/discount state for {d['symbol']} as a short Telegram trade brief.
+    prompt = f"""Break down this SMC premium/discount state for {d['symbol']} as a Telegram trade brief covering BOTH possible directions — the person wants to see the long setup and the short setup every time, not just whichever one is aligned, so they can also choose to fade the aligned move if they want.
 
 Price: {d['price']:.2f}
+
 Daily zone: {d['daily']['zone']} ({d['daily']['pct']}% of range), range {d['daily']['bottom']:.2f}-{d['daily']['top']:.2f}
 Daily structure: {d['daily']['top_label']} at {d['daily']['top']:.2f}, {d['daily']['bottom_label']} at {d['daily']['bottom']:.2f} (bias: {d['daily']['bias'] or 'unconfirmed'})
+
 4H zone: {d['h4']['zone']} ({d['h4']['pct']}% of range), range {d['h4']['bottom']:.2f}-{d['h4']['top']:.2f}
 4H structure: {d['h4']['top_label']} at {d['h4']['top']:.2f}, {d['h4']['bottom_label']} at {d['h4']['bottom']:.2f} (bias: {d['h4']['bias'] or 'unconfirmed'})
-4H fib .71 entry level (anchored to the 4H dealing range, retraced from the weak side toward the strong side): {d['h4']['fib_071']:.2f}
-Alignment: {'YES, bias ' + d['bias'] if d['aligned'] else 'NO'}
-4H bullish OB: {fmt_ob(d['h4']['bull_ob'])}
-4H bearish OB: {fmt_ob(d['h4']['bear_ob'])}
 
-Write 5-8 lines, plain text, no markdown headers, no disclaimers:
-- current daily and 4H zone state, and which side is the Strong vs Weak swing on each
-- whether they're aligned and what bias that implies
-- if aligned, the 4H fib .71 price to watch for entry, and whether it lines up with the 4H order block (confluence)
-- if not aligned, what needs to happen for alignment"""
+4H LONG setup: fib .71 buy zone at {d['h4']['fib_long']:.2f}, bullish OB {fmt_ob(d['h4']['bull_ob'])}
+4H SHORT setup: fib .71 sell zone at {d['h4']['fib_short']:.2f}, bearish OB {fmt_ob(d['h4']['bear_ob'])}
+
+Daily/4H alignment: {'YES — with-trend bias is ' + d['bias'] + ', counter-trend fade would be ' + str(d['counter_bias']) if d['aligned'] else 'NO — daily and 4H are in different zones right now'}
+
+Write a clear, structured plain-text brief (no markdown headers, no disclaimers) with these parts, each 1-3 lines:
+1. Daily and 4H state — zone, and which side is the Strong vs Weak swing on each
+2. LONG setup — the fib .71 buy price and OB confluence, and whether it's the with-trend or counter-trend trade right now
+3. SHORT setup — the fib .71 sell price and OB confluence, and whether it's the with-trend or counter-trend trade right now
+4. Bottom line — which direction has HTF/LTF alignment behind it, and what the honest case for fading it would look like instead"""
 
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         resp = client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=400,
+            max_tokens=600,
             messages=[{"role": "user", "content": prompt}],
         )
         return "".join(b.text for b in resp.content if b.type == "text").strip()
