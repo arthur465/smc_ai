@@ -21,10 +21,11 @@ reuse the same Railway env group without adding duplicates):
 
 Optional, unique to this script (no equivalent in the merged bot):
   ANTHROPIC_MODEL         default 'claude-sonnet-5'
-  SWING_LEFT_DAILY        default 10   (fractal lookback, bars each side)
-  SWING_RIGHT_DAILY       default 10
-  SWING_LEFT_4H           default 10
-  SWING_RIGHT_4H          default 10
+  SWING_LENGTH_DAILY      default 50   (bars to confirm a swing pivot, matches
+                          the merged bot's cfg.swing_length default)
+  SWING_LENGTH_4H         default 50
+  PD_BAND                 default 0.05 (premium/discount edge fraction, matches
+                          the merged bot's cfg.premium_discount_band default)
   OB_LOOKBACK             default 150  (bars scanned for order blocks)
   HEARTBEAT_HOURS         default 6    (post even with no change after this long)
   SMC_PD_STATE_FILE       default 'pd_zone_state.json'  (own file — separate
@@ -42,6 +43,7 @@ import time
 import logging
 
 import ccxt
+import numpy as np
 import pandas as pd
 import requests
 import mplfinance as mpf
@@ -65,10 +67,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
 
-SWING_LEFT_DAILY = int(os.getenv("SWING_LEFT_DAILY", 10))
-SWING_RIGHT_DAILY = int(os.getenv("SWING_RIGHT_DAILY", 10))
-SWING_LEFT_4H = int(os.getenv("SWING_LEFT_4H", 10))
-SWING_RIGHT_4H = int(os.getenv("SWING_RIGHT_4H", 10))
+SWING_LENGTH_DAILY = int(os.getenv("SWING_LENGTH_DAILY", 50))
+SWING_LENGTH_4H = int(os.getenv("SWING_LENGTH_4H", 50))
+PD_BAND = float(os.getenv("PD_BAND", 0.05))
 
 OB_LOOKBACK = int(os.getenv("OB_LOOKBACK", 150))
 POLL_SECONDS = int(os.getenv("SMC_POLL_SECONDS", 900))
@@ -85,7 +86,7 @@ exchange = ccxt.okx({"enableRateLimit": True})
 # ---------------------------------------------------------------------------
 # DATA
 # ---------------------------------------------------------------------------
-def fetch_ohlcv(symbol, timeframe, limit=300):
+def fetch_ohlcv(symbol, timeframe, limit=500):
     raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
@@ -94,9 +95,111 @@ def fetch_ohlcv(symbol, timeframe, limit=300):
 
 # ---------------------------------------------------------------------------
 # SWING STRUCTURE -> TRAILING RANGE -> PREMIUM/DISCOUNT ZONE
+#
+# Faithful port of LuxAlgo's leg()/getCurrentStructure()/updateTrailingExtremes,
+# same algorithm your smc_ai_alert_bot_merged.py's SMCEngine uses. The dealing
+# range does NOT reset both sides on every BOS/CHoCH — it only re-anchors the
+# side that just confirmed a new pivot (top on a new bearish leg, bottom on a
+# new bullish leg), while the other side keeps expanding outward with each
+# bar's high/low until it gets its own reversal confirmation. That's what
+# makes the range expand until price eventually breaks and confirms both
+# sides. An earlier version of this script used a symmetric left/right
+# fractal per timeframe instead, which doesn't reproduce that expand-until-
+# broken behavior and was reading the wrong side as premium/discount.
 # ---------------------------------------------------------------------------
-def find_swings(df, left, right):
-    """Confirmed fractal swing highs/lows. Returns two lists of (index, price)."""
+def compute_legs(df, size):
+    """Reproduces `leg(size)`: BEARISH_LEG (0) while trending down, BULLISH_LEG (1)
+    while trending up, flipping when a `size`-bars-back extreme survives the most
+    recent `size`-bar rolling window unbroken."""
+    high, low = df["high"].values, df["low"].values
+    n = len(df)
+    roll_high = df["high"].rolling(size).max().values
+    roll_low = df["low"].rolling(size).min().values
+
+    legs = np.zeros(n, dtype=int)
+    cur = 0  # BEARISH_LEG
+    for i in range(n):
+        if i < size or np.isnan(roll_high[i]) or np.isnan(roll_low[i]):
+            legs[i] = cur
+            continue
+        new_leg_high = high[i - size] > roll_high[i]
+        new_leg_low = low[i - size] < roll_low[i]
+        if new_leg_high:
+            cur = 0
+        elif new_leg_low:
+            cur = 1
+        legs[i] = cur
+    return legs
+
+
+def compute_trailing_range(df, length):
+    """
+    Walks the dataframe bar-by-bar maintaining trailing top/bottom exactly like
+    the indicator: re-anchor the side whose leg just confirmed, then let both
+    sides expand to the current bar's high/low. Returns the range as of the
+    most recent bar.
+    """
+    n = len(df)
+    high, low = df["high"].values, df["low"].values
+    ts = df["ts"].values
+    legs = compute_legs(df, length)
+
+    trailing_top = float(high[0])
+    trailing_bottom = float(low[0])
+    top_time = ts[0]
+    bottom_time = ts[0]
+
+    for i in range(n):
+        if i >= length and legs[i] != legs[i - 1]:
+            src_i = i - length
+            if legs[i] == 1:  # new bullish leg -> swing low just confirmed
+                trailing_bottom = float(low[src_i])
+                bottom_time = ts[src_i]
+            else:  # new bearish leg -> swing high just confirmed
+                trailing_top = float(high[src_i])
+                top_time = ts[src_i]
+
+        if high[i] >= trailing_top:
+            trailing_top = float(high[i])
+            top_time = ts[i]
+        if low[i] <= trailing_bottom:
+            trailing_bottom = float(low[i])
+            bottom_time = ts[i]
+
+    return {
+        "top": trailing_top, "top_time": pd.Timestamp(top_time),
+        "bottom": trailing_bottom, "bottom_time": pd.Timestamp(bottom_time),
+    }
+
+
+def classify_zone(price, top, bottom, band=PD_BAND):
+    """
+    Same thresholds as the merged bot's PremiumDiscountZones/classify_zone:
+    premium = top `band` fraction of the range, discount = bottom `band`
+    fraction, everything else (including the whole 50% midline) is
+    equilibrium — deliberately narrow bands, not a simple above/below-50% split.
+    """
+    rng = top - bottom
+    if rng <= 0:
+        return "Equilibrium", 50.0
+    pct = (price - bottom) / rng * 100
+    premium_bottom = (1 - band) * top + band * bottom
+    discount_top = (1 - band) * bottom + band * top
+    if price >= premium_bottom:
+        zone = "Premium"
+    elif price <= discount_top:
+        zone = "Discount"
+    else:
+        zone = "Equilibrium"
+    return zone, round(pct, 1)
+
+
+# ---------------------------------------------------------------------------
+# SIMPLIFIED ORDER BLOCK DETECTION
+# ---------------------------------------------------------------------------
+def find_fractals(df, left, right):
+    """Simple symmetric fractal highs/lows — only used for the OB proxy below,
+    not for the premium/discount range (see compute_trailing_range for that)."""
     highs, lows = [], []
     n = len(df)
     for i in range(left, n - right):
@@ -109,48 +212,6 @@ def find_swings(df, left, right):
     return highs, lows
 
 
-def trailing_range(df, left, right):
-    """
-    Most recent confirmed swing high/low define the active premium/discount
-    range — same concept as LuxAlgo's trailing.top/trailing.bottom. Falls
-    back to the full-window high/low if nothing's confirmed yet.
-    """
-    highs, lows = find_swings(df, left, right)
-    top = highs[-1][1] if highs else df["high"].max()
-    top_i = highs[-1][0] if highs else df["high"].idxmax()
-    bottom = lows[-1][1] if lows else df["low"].min()
-    bottom_i = lows[-1][0] if lows else df["low"].idxmin()
-    return {
-        "top": float(top), "top_time": df["ts"].iloc[top_i],
-        "bottom": float(bottom), "bottom_time": df["ts"].iloc[bottom_i],
-    }
-
-
-def classify_zone(price, top, bottom):
-    """
-    Premium: upper zone above the 52.5% equilibrium band.
-    Discount: lower zone below the 47.5% equilibrium band.
-    Equilibrium: the 47.5%-52.5% band in between.
-    Same split LuxAlgo uses for its Premium/Equilibrium/Discount boxes.
-    """
-    rng = top - bottom
-    if rng <= 0:
-        return "Equilibrium", 50.0
-    pct = (price - bottom) / rng * 100
-    eq_hi = 0.525 * top + 0.475 * bottom
-    eq_lo = 0.525 * bottom + 0.475 * top
-    if price >= eq_hi:
-        zone = "Premium"
-    elif price <= eq_lo:
-        zone = "Discount"
-    else:
-        zone = "Equilibrium"
-    return zone, round(pct, 1)
-
-
-# ---------------------------------------------------------------------------
-# SIMPLIFIED ORDER BLOCK DETECTION
-# ---------------------------------------------------------------------------
 def find_order_blocks(df, lookback=150, left=5, right=5):
     """
     Lightweight self-contained OB finder: last opposite-colored candle before
@@ -160,7 +221,7 @@ def find_order_blocks(df, lookback=150, left=5, right=5):
     — good enough to flag a level to watch, not precision-tuned.
     """
     sub = df.tail(lookback).reset_index(drop=True)
-    highs, lows = find_swings(sub, left, right)
+    highs, lows = find_fractals(sub, left, right)
 
     bearish_ob = None
     for idx, level in reversed(lows):
@@ -240,13 +301,13 @@ def make_chart(df, zone_range, bull_ob, bear_ob, title, path):
 # ANALYSIS
 # ---------------------------------------------------------------------------
 def analyze():
-    daily = fetch_ohlcv(SYMBOL, "1d", 300)
-    h4 = fetch_ohlcv(SYMBOL, "4h", 300)
+    daily = fetch_ohlcv(SYMBOL, "1d", 500)
+    h4 = fetch_ohlcv(SYMBOL, "4h", 500)
 
     price = float(h4["close"].iloc[-1])
 
-    d_range = trailing_range(daily, SWING_LEFT_DAILY, SWING_RIGHT_DAILY)
-    h_range = trailing_range(h4, SWING_LEFT_4H, SWING_RIGHT_4H)
+    d_range = compute_trailing_range(daily, SWING_LENGTH_DAILY)
+    h_range = compute_trailing_range(h4, SWING_LENGTH_4H)
 
     d_zone, d_pct = classify_zone(price, d_range["top"], d_range["bottom"])
     h_zone, h_pct = classify_zone(price, h_range["top"], h_range["bottom"])
