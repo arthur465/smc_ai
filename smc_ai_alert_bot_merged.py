@@ -132,15 +132,33 @@ def compute_legs(df, size):
     return legs
 
 
-def compute_trailing_range(df, length):
+def compute_structure(df, length, fib_level=0.71):
     """
-    Walks the dataframe bar-by-bar maintaining trailing top/bottom exactly like
-    the indicator: re-anchor the side whose leg just confirmed, then let both
-    sides expand to the current bar's high/low. Returns the range as of the
-    most recent bar.
+    Walks the dataframe bar-by-bar maintaining:
+      - trailing top/bottom (the dealing range) exactly like the indicator:
+        re-anchor the side whose leg just confirmed, then let both sides
+        expand to the current bar's high/low.
+      - the swing trend bias (BULLISH/BEARISH), by tracking the last confirmed
+        swing-high and swing-low pivot levels and flagging the first close
+        that crosses each one (mirrors displayStructure()'s BOS/CHoCH check).
+        This uses the fixed confirmed-pivot level, not the ever-expanding
+        trailing top/bottom, since that's what the real indicator crosses
+        against.
+      - strong/weak labels off that bias: in a bearish trend the top is the
+        Strong High (the origin of the down-leg, unlikely to break) and the
+        bottom is the Weak Low (formed on the same push, expected to get
+        swept before a real reversal); a bullish trend flips that — Strong
+        Low, Weak High.
+      - a 0.71 fib anchored to the dealing range, measured FROM the weak side
+        TOWARD the strong side (71% of the way back). In a downtrend that
+        lands high in the range (premium, short entry); in an uptrend it
+        lands low in the range (discount, long entry). Recomputed fresh from
+        the live top/bottom every call, so it re-anchors automatically
+        whenever the range expands or resets.
+    Returns the state as of the most recent bar.
     """
     n = len(df)
-    high, low = df["high"].values, df["low"].values
+    high, low, close = df["high"].values, df["low"].values, df["close"].values
     ts = df["ts"].values
     legs = compute_legs(df, length)
 
@@ -149,15 +167,23 @@ def compute_trailing_range(df, length):
     top_time = ts[0]
     bottom_time = ts[0]
 
+    swing_high_level, swing_high_crossed = None, False
+    swing_low_level, swing_low_crossed = None, False
+    bias = None  # None until the first confirmed BOS/CHoCH, then "BULLISH"/"BEARISH"
+
     for i in range(n):
         if i >= length and legs[i] != legs[i - 1]:
             src_i = i - length
             if legs[i] == 1:  # new bullish leg -> swing low just confirmed
                 trailing_bottom = float(low[src_i])
                 bottom_time = ts[src_i]
+                swing_low_level = float(low[src_i])
+                swing_low_crossed = False
             else:  # new bearish leg -> swing high just confirmed
                 trailing_top = float(high[src_i])
                 top_time = ts[src_i]
+                swing_high_level = float(high[src_i])
+                swing_high_crossed = False
 
         if high[i] >= trailing_top:
             trailing_top = float(high[i])
@@ -166,9 +192,29 @@ def compute_trailing_range(df, length):
             trailing_bottom = float(low[i])
             bottom_time = ts[i]
 
+        if swing_high_level is not None and not swing_high_crossed and close[i] > swing_high_level:
+            bias = "BULLISH"
+            swing_high_crossed = True
+        if swing_low_level is not None and not swing_low_crossed and close[i] < swing_low_level:
+            bias = "BEARISH"
+            swing_low_crossed = True
+
+    if bias == "BEARISH":
+        top_label, bottom_label = "Strong High", "Weak Low"
+        weak_price, strong_price = trailing_bottom, trailing_top
+    elif bias == "BULLISH":
+        top_label, bottom_label = "Weak High", "Strong Low"
+        weak_price, strong_price = trailing_top, trailing_bottom
+    else:
+        top_label, bottom_label = "High", "Low"
+        weak_price = strong_price = None
+
+    fib_071 = (weak_price + fib_level * (strong_price - weak_price)) if bias else (trailing_top + trailing_bottom) / 2
+
     return {
-        "top": trailing_top, "top_time": pd.Timestamp(top_time),
-        "bottom": trailing_bottom, "bottom_time": pd.Timestamp(bottom_time),
+        "top": trailing_top, "top_time": pd.Timestamp(top_time), "top_label": top_label,
+        "bottom": trailing_bottom, "bottom_time": pd.Timestamp(bottom_time), "bottom_label": bottom_label,
+        "bias": bias, "fib_071": float(fib_071),
     }
 
 
@@ -264,9 +310,10 @@ def find_order_blocks(df, lookback=150, left=5, right=5):
 def make_chart(df, zone_range, bull_ob, bear_ob, title, path):
     """
     Candles for the last CHART_BARS bars with the premium/discount range
-    shaded (red = premium, green = discount, gray = equilibrium) and any
-    unmitigated order blocks overlaid as blue (bullish) / orange (bearish)
-    bands. Saved to `path` as a PNG.
+    shaded (red = premium, green = discount, gray = equilibrium), the
+    strong/weak swing labels on the top/bottom boundary, the 0.71 fib
+    entry level as a bold gold line, and any unmitigated order blocks
+    overlaid as blue (bullish) / orange (bearish) bands. Saved to `path`.
     """
     plot_df = df.tail(CHART_BARS).set_index("ts")[["open", "high", "low", "close", "volume"]]
 
@@ -287,6 +334,19 @@ def make_chart(df, zone_range, bull_ob, bear_ob, title, path):
     ax.axhline(eq_hi, color="gray", linestyle=":", linewidth=0.6)
     ax.axhline(eq_lo, color="gray", linestyle=":", linewidth=0.6)
 
+    x_right = len(plot_df) - 1
+    ax.text(x_right, top, f" {zone_range['top_label']} {top:.2f}", va="bottom", ha="right",
+            fontsize=8, color="darkred")
+    ax.text(x_right, bottom, f" {zone_range['bottom_label']} {bottom:.2f}", va="top", ha="right",
+            fontsize=8, color="darkgreen")
+
+    fib = zone_range.get("fib_071")
+    if fib is not None:
+        ax.axhline(fib, color="gold", linestyle="-", linewidth=1.6, zorder=5)
+        ax.text(0, fib, f" Fib .71 — {fib:.2f} ", va="center", ha="left",
+                fontsize=8, fontweight="bold", color="darkgoldenrod",
+                backgroundcolor="white")
+
     if bull_ob:
         ax.axhspan(bull_ob["low"], bull_ob["high"], color="blue", alpha=0.15)
     if bear_ob:
@@ -306,8 +366,8 @@ def analyze():
 
     price = float(h4["close"].iloc[-1])
 
-    d_range = compute_trailing_range(daily, SWING_LENGTH_DAILY)
-    h_range = compute_trailing_range(h4, SWING_LENGTH_4H)
+    d_range = compute_structure(daily, SWING_LENGTH_DAILY)
+    h_range = compute_structure(h4, SWING_LENGTH_4H)
 
     d_zone, d_pct = classify_zone(price, d_range["top"], d_range["bottom"])
     h_zone, h_pct = classify_zone(price, h_range["top"], h_range["bottom"])
@@ -318,15 +378,16 @@ def analyze():
     aligned = d_zone in ("Premium", "Discount") and d_zone == h_zone
     if aligned:
         bias = "LONG" if d_zone == "Discount" else "SHORT"
+        watch_fib = h_range["fib_071"]
         watch_ob = h_bull_ob if bias == "LONG" else h_bear_ob
     else:
-        bias, watch_ob = "NO ALIGNMENT", None
+        bias, watch_fib, watch_ob = "NO ALIGNMENT", None, None
 
     data = {
         "symbol": SYMBOL, "price": price,
         "daily": {"zone": d_zone, "pct": d_pct, **d_range, "bull_ob": d_bull_ob, "bear_ob": d_bear_ob},
         "h4": {"zone": h_zone, "pct": h_pct, **h_range, "bull_ob": h_bull_ob, "bear_ob": h_bear_ob},
-        "aligned": aligned, "bias": bias, "watch_ob": watch_ob,
+        "aligned": aligned, "bias": bias, "watch_fib": watch_fib, "watch_ob": watch_ob,
     }
     return data, daily, h4
 
@@ -341,11 +402,14 @@ def fmt_ob(ob):
 def fallback_summary(d):
     lines = [
         f"{d['symbol']} @ {d['price']:.2f}",
-        f"Daily: {d['daily']['zone']} ({d['daily']['pct']}% of range {d['daily']['bottom']:.2f}-{d['daily']['top']:.2f})",
-        f"4H: {d['h4']['zone']} ({d['h4']['pct']}% of range {d['h4']['bottom']:.2f}-{d['h4']['top']:.2f})",
+        f"Daily: {d['daily']['zone']} ({d['daily']['pct']}% of range) — "
+        f"{d['daily']['top_label']} {d['daily']['top']:.2f} / {d['daily']['bottom_label']} {d['daily']['bottom']:.2f}",
+        f"4H: {d['h4']['zone']} ({d['h4']['pct']}% of range) — "
+        f"{d['h4']['top_label']} {d['h4']['top']:.2f} / {d['h4']['bottom_label']} {d['h4']['bottom']:.2f}",
     ]
     if d["aligned"]:
-        lines.append(f"Aligned -> bias {d['bias']}. Watch 4H OB: {fmt_ob(d['watch_ob'])}")
+        lines.append(f"Aligned -> bias {d['bias']}. 4H fib .71 entry: {d['watch_fib']:.2f}. "
+                     f"4H OB confluence: {fmt_ob(d['watch_ob'])}")
     else:
         lines.append("Not aligned — wait for daily and 4H to agree before sizing up.")
     return "\n".join(lines)
@@ -359,17 +423,18 @@ def llm_summary(d):
 
 Price: {d['price']:.2f}
 Daily zone: {d['daily']['zone']} ({d['daily']['pct']}% of range), range {d['daily']['bottom']:.2f}-{d['daily']['top']:.2f}
+Daily structure: {d['daily']['top_label']} at {d['daily']['top']:.2f}, {d['daily']['bottom_label']} at {d['daily']['bottom']:.2f} (bias: {d['daily']['bias'] or 'unconfirmed'})
 4H zone: {d['h4']['zone']} ({d['h4']['pct']}% of range), range {d['h4']['bottom']:.2f}-{d['h4']['top']:.2f}
+4H structure: {d['h4']['top_label']} at {d['h4']['top']:.2f}, {d['h4']['bottom_label']} at {d['h4']['bottom']:.2f} (bias: {d['h4']['bias'] or 'unconfirmed'})
+4H fib .71 entry level (anchored to the 4H dealing range, retraced from the weak side toward the strong side): {d['h4']['fib_071']:.2f}
 Alignment: {'YES, bias ' + d['bias'] if d['aligned'] else 'NO'}
-Daily bullish OB: {fmt_ob(d['daily']['bull_ob'])}
-Daily bearish OB: {fmt_ob(d['daily']['bear_ob'])}
 4H bullish OB: {fmt_ob(d['h4']['bull_ob'])}
 4H bearish OB: {fmt_ob(d['h4']['bear_ob'])}
 
 Write 5-8 lines, plain text, no markdown headers, no disclaimers:
-- current daily and 4H zone state
+- current daily and 4H zone state, and which side is the Strong vs Weak swing on each
 - whether they're aligned and what bias that implies
-- if aligned, the specific order block price levels to watch for entries
+- if aligned, the 4H fib .71 price to watch for entry, and whether it lines up with the 4H order block (confluence)
 - if not aligned, what needs to happen for alignment"""
 
     try:
