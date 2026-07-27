@@ -27,6 +27,9 @@ Optional, unique to this script (no equivalent in the merged bot):
   PD_BAND                 default 0.05 (premium/discount edge fraction, matches
                           the merged bot's cfg.premium_discount_band default)
   OB_LOOKBACK             default 150  (bars scanned for order blocks)
+  BREAKER_Z_LEN           default 100  (z-score window for breaker impulse detection)
+  BREAKER_Z_THRESHOLD     default 4.0  (z-score crossover level that flags an impulse)
+  BREAKER_MAX_AGE         default 500  (bars before an unmitigated breaker/OB candidate expires)
   HEARTBEAT_HOURS         default 6    (post even with no change after this long)
   SMC_PD_STATE_FILE       default 'pd_zone_state.json'  (own file — separate
                           from SMC_STATE_DB, which is the other bot's sqlite
@@ -72,6 +75,9 @@ SWING_LENGTH_4H = int(os.getenv("SWING_LENGTH_4H", 50))
 PD_BAND = float(os.getenv("PD_BAND", 0.05))
 
 OB_LOOKBACK = int(os.getenv("OB_LOOKBACK", 150))
+BREAKER_Z_LEN = int(os.getenv("BREAKER_Z_LEN", 100))
+BREAKER_Z_THRESHOLD = float(os.getenv("BREAKER_Z_THRESHOLD", 4.0))
+BREAKER_MAX_AGE = int(os.getenv("BREAKER_MAX_AGE", 500))
 POLL_SECONDS = int(os.getenv("SMC_POLL_SECONDS", 900))
 HEARTBEAT_HOURS = float(os.getenv("HEARTBEAT_HOURS", 6))
 STATE_FILE = os.getenv("SMC_PD_STATE_FILE", "pd_zone_state.json")
@@ -326,15 +332,151 @@ def find_order_blocks(df, lookback=150, left=5, right=5):
 
 
 # ---------------------------------------------------------------------------
+# BREAKER BLOCKS (port of AlgoAlpha's "Breaker Blocks Signals", 4H only)
+#
+# Cumulative same-direction move distance (updist/downdist) gets z-scored
+# against a rolling window; a z-score crossing above the threshold flags an
+# impulsive move. That creates an order-block candidate box from the last
+# opposite-colored candle before the impulse. If price later closes back
+# through that candidate for two consecutive bars, the OB failed and flips
+# polarity into a "breaker" block (a failed bullish OB becomes bearish
+# resistance; a failed bearish OB becomes bullish support). Boxes expire
+# after BREAKER_MAX_AGE bars if never mitigated.
+#
+# Only 4H breakers get computed at all — per your call, no daily, no LTF.
+# On top of that, a breaker only counts if it's currently sitting in its
+# "appropriate" zone of the live 4H dealing range: bullish breaker in
+# Discount, bearish breaker in Premium. Anything else (a bear breaker
+# sitting in discount, a bull breaker in premium, either one stuck in
+# equilibrium) gets thrown out entirely — it's never returned, drawn, or
+# mentioned, exactly like an opposing breaker should be ignored.
+# ---------------------------------------------------------------------------
+def compute_breakers(df, z_len=100, z_threshold=4.0, max_age=500):
+    """
+    Returns (bull_breakers, bear_breakers): lists of currently active
+    (unmitigated, unexpired) breaker boxes as of the last bar, each
+    {'top', 'bottom', 'start', 'formed_time'}. Unfiltered by zone — the
+    caller applies the discount/premium filter.
+    """
+    o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
+    ts = df["ts"].values
+    n = len(df)
+
+    updist = np.zeros(n)
+    downdist = np.zeros(n)
+    for i in range(n):
+        prev_up = updist[i - 1] if i > 0 else 0.0
+        prev_dn = downdist[i - 1] if i > 0 else 0.0
+        updist[i] = prev_up + (c[i] - o[i]) if c[i] > o[i] else 0.0
+        downdist[i] = prev_dn + (o[i] - c[i]) if c[i] < o[i] else 0.0
+
+    up_mean = pd.Series(updist).rolling(z_len).mean().values
+    up_std = pd.Series(updist).rolling(z_len).std(ddof=0).values
+    dn_mean = pd.Series(downdist).rolling(z_len).mean().values
+    dn_std = pd.Series(downdist).rolling(z_len).std(ddof=0).values
+
+    z_up = np.where((up_std > 0) & ~np.isnan(up_std), (updist - up_mean) / np.where(up_std == 0, np.nan, up_std), np.nan)
+    z_dn = np.where((dn_std > 0) & ~np.isnan(dn_std), (downdist - dn_mean) / np.where(dn_std == 0, np.nan, dn_std), np.nan)
+
+    def overlaps(top_new, bottom_new, *box_lists):
+        for boxes in box_lists:
+            for bx in boxes:
+                if top_new > bx["bottom"] and bottom_new < bx["top"]:
+                    return True
+        return False
+
+    last_down_idx, last_up_idx = None, None
+    bull_cand, bear_cand = [], []   # OB candidates awaiting mitigation
+    breaker_bull, breaker_bear = [], []  # confirmed, still-active breakers
+
+    for i in range(n):
+        if c[i] < o[i]:
+            last_down_idx = i
+        if c[i] > o[i]:
+            last_up_idx = i
+
+        prev_z_up = z_up[i - 1] if i > 0 else np.nan
+        prev_z_dn = z_dn[i - 1] if i > 0 else np.nan
+        bullish_signal = (not np.isnan(z_up[i]) and not np.isnan(prev_z_up)
+                          and prev_z_up <= z_threshold and z_up[i] > z_threshold and prev_z_up != 0)
+        bearish_signal = (not np.isnan(z_dn[i]) and not np.isnan(prev_z_dn)
+                          and prev_z_dn <= z_threshold and z_dn[i] > z_threshold and prev_z_dn != 0)
+
+        if bullish_signal and last_down_idx is not None:
+            t, b = float(h[last_down_idx]), float(l[last_down_idx])
+            if not overlaps(t, b, bull_cand, bear_cand, breaker_bull, breaker_bear):
+                bull_cand.append({"top": t, "bottom": b, "start": last_down_idx})
+
+        if bearish_signal and last_up_idx is not None:
+            t, b = float(h[last_up_idx]), float(l[last_up_idx])
+            if not overlaps(t, b, bull_cand, bear_cand, breaker_bull, breaker_bear):
+                bear_cand.append({"top": t, "bottom": b, "start": last_up_idx})
+
+        still = []
+        for bx in bull_cand:
+            mitigated = i >= 1 and c[i] < bx["bottom"] and c[i - 1] < bx["bottom"]
+            expired = (i - bx["start"]) >= max_age
+            if mitigated and not overlaps(bx["top"], bx["bottom"], breaker_bull, breaker_bear):
+                breaker_bear.append({"top": bx["top"], "bottom": bx["bottom"], "start": i, "formed_time": ts[i]})
+            if not (mitigated or expired):
+                still.append(bx)
+        bull_cand = still
+
+        still = []
+        for bx in bear_cand:
+            mitigated = i >= 1 and c[i] > bx["top"] and c[i - 1] > bx["top"]
+            expired = (i - bx["start"]) >= max_age
+            if mitigated and not overlaps(bx["top"], bx["bottom"], breaker_bull, breaker_bear):
+                breaker_bull.append({"top": bx["top"], "bottom": bx["bottom"], "start": i, "formed_time": ts[i]})
+            if not (mitigated or expired):
+                still.append(bx)
+        bear_cand = still
+
+        breaker_bull = [bx for bx in breaker_bull
+                         if not (i >= 1 and c[i] < bx["bottom"] and c[i - 1] < bx["bottom"])
+                         and (i - bx["start"]) < max_age]
+        breaker_bear = [bx for bx in breaker_bear
+                         if not (i >= 1 and c[i] > bx["top"] and c[i - 1] > bx["top"])
+                         and (i - bx["start"]) < max_age]
+
+    for bx in breaker_bull + breaker_bear:
+        bx["formed_time"] = pd.Timestamp(bx["formed_time"])
+
+    return breaker_bull, breaker_bear
+
+
+def find_valid_breakers(df, top, bottom, z_len=100, z_threshold=4.0, max_age=500, band=PD_BAND):
+    """
+    Runs compute_breakers, then drops anything not sitting in its correct
+    zone of the given [bottom, top] range: bull breaker must classify as
+    Discount, bear breaker must classify as Premium. Everything else is
+    discarded — never returned. Returns the single most recently formed
+    valid bull breaker and bear breaker (or None each).
+    """
+    bull_breakers, bear_breakers = compute_breakers(df, z_len, z_threshold, max_age)
+
+    valid_bull = [bx for bx in bull_breakers
+                  if classify_zone((bx["top"] + bx["bottom"]) / 2, top, bottom, band)[0] == "Discount"]
+    valid_bear = [bx for bx in bear_breakers
+                  if classify_zone((bx["top"] + bx["bottom"]) / 2, top, bottom, band)[0] == "Premium"]
+
+    best_bull = max(valid_bull, key=lambda bx: bx["start"]) if valid_bull else None
+    best_bear = max(valid_bear, key=lambda bx: bx["start"]) if valid_bear else None
+    return best_bull, best_bear
+
+
+# ---------------------------------------------------------------------------
 # CHART SNAPSHOTS
 # ---------------------------------------------------------------------------
-def make_chart(df, zone_range, bull_ob, bear_ob, title, path):
+def make_chart(df, zone_range, bull_ob, bear_ob, title, path, bull_breaker=None, bear_breaker=None):
     """
     Candles for the last CHART_BARS bars with the premium/discount range
     shaded (red = premium, green = discount, gray = equilibrium), the
-    strong/weak swing labels on the top/bottom boundary, the 0.71 fib
-    entry level as a bold gold line, and any unmitigated order blocks
-    overlaid as blue (bullish) / orange (bearish) bands. Saved to `path`.
+    strong/weak swing labels on the top/bottom boundary, both 0.71 fib
+    entry levels, any unmitigated order blocks (blue/orange), and — 4H
+    only — a zone-filtered breaker block (teal = bullish support breaker
+    in discount, crimson = bearish resistance breaker in premium). Saved
+    to `path`.
     """
     plot_df = df.tail(CHART_BARS).set_index("ts")[["open", "high", "low", "close", "volume"]]
 
@@ -384,6 +526,19 @@ def make_chart(df, zone_range, bull_ob, bear_ob, title, path):
     if bear_ob:
         ax.axhspan(bear_ob["low"], bear_ob["high"], color="orange", alpha=0.15)
 
+    if bull_breaker:
+        ax.axhspan(bull_breaker["bottom"], bull_breaker["top"], facecolor="teal", alpha=0.28,
+                   edgecolor="teal", linewidth=1.2, zorder=4)
+        mid = (bull_breaker["top"] + bull_breaker["bottom"]) / 2
+        ax.text(x_right, mid, f" Bull Breaker (discount) {bull_breaker['bottom']:.2f}-{bull_breaker['top']:.2f} ",
+                va="center", ha="right", fontsize=8, fontweight="bold", color="teal", backgroundcolor="white")
+    if bear_breaker:
+        ax.axhspan(bear_breaker["bottom"], bear_breaker["top"], facecolor="crimson", alpha=0.22,
+                   edgecolor="crimson", linewidth=1.2, zorder=4)
+        mid = (bear_breaker["top"] + bear_breaker["bottom"]) / 2
+        ax.text(x_right, mid, f" Bear Breaker (premium) {bear_breaker['bottom']:.2f}-{bear_breaker['top']:.2f} ",
+                va="center", ha="right", fontsize=8, fontweight="bold", color="crimson", backgroundcolor="white")
+
     fig.savefig(path, dpi=130, bbox_inches="tight")
     plt.close(fig)
     return path
@@ -407,6 +562,12 @@ def analyze():
     d_bull_ob, d_bear_ob = find_order_blocks(daily, OB_LOOKBACK)
     h_bull_ob, h_bear_ob = find_order_blocks(h4, OB_LOOKBACK)
 
+    # 4H only, per your call — daily/LTF breakers aren't computed at all.
+    h_bull_breaker, h_bear_breaker = find_valid_breakers(
+        h4, h_range["top"], h_range["bottom"],
+        BREAKER_Z_LEN, BREAKER_Z_THRESHOLD, BREAKER_MAX_AGE,
+    )
+
     aligned = d_zone in ("Premium", "Discount") and d_zone == h_zone
     if aligned:
         bias = "LONG" if d_zone == "Discount" else "SHORT"
@@ -422,7 +583,8 @@ def analyze():
     data = {
         "symbol": SYMBOL, "price": price,
         "daily": {"zone": d_zone, "pct": d_pct, **d_range, "bull_ob": d_bull_ob, "bear_ob": d_bear_ob},
-        "h4": {"zone": h_zone, "pct": h_pct, **h_range, "bull_ob": h_bull_ob, "bear_ob": h_bear_ob},
+        "h4": {"zone": h_zone, "pct": h_pct, **h_range, "bull_ob": h_bull_ob, "bear_ob": h_bear_ob,
+               "bull_breaker": h_bull_breaker, "bear_breaker": h_bear_breaker},
         "aligned": aligned,
         "bias": bias, "watch_fib": watch_fib, "watch_ob": watch_ob,
         "counter_bias": counter_bias, "counter_fib": counter_fib, "counter_ob": counter_ob,
@@ -437,6 +599,10 @@ def fmt_ob(ob):
     return f"{ob['low']:.2f}-{ob['high']:.2f}" if ob else "none unmitigated"
 
 
+def fmt_breaker(bx):
+    return f"{bx['bottom']:.2f}-{bx['top']:.2f}" if bx else "none active in zone"
+
+
 def fallback_summary(d):
     lines = [
         f"{d['symbol']} @ {d['price']:.2f}",
@@ -445,8 +611,10 @@ def fallback_summary(d):
         f"4H: {d['h4']['zone']} ({d['h4']['pct']}% of range) — "
         f"{d['h4']['top_label']} {d['h4']['top']:.2f} / {d['h4']['bottom_label']} {d['h4']['bottom']:.2f}",
         "",
-        f"LONG setup — 4H fib .71 buy zone: {d['h4']['fib_long']:.2f} | 4H bullish OB: {fmt_ob(d['h4']['bull_ob'])}",
-        f"SHORT setup — 4H fib .71 sell zone: {d['h4']['fib_short']:.2f} | 4H bearish OB: {fmt_ob(d['h4']['bear_ob'])}",
+        f"LONG setup — 4H fib .71 buy zone: {d['h4']['fib_long']:.2f} | 4H bullish OB: {fmt_ob(d['h4']['bull_ob'])} "
+        f"| 4H bull breaker (discount only): {fmt_breaker(d['h4']['bull_breaker'])}",
+        f"SHORT setup — 4H fib .71 sell zone: {d['h4']['fib_short']:.2f} | 4H bearish OB: {fmt_ob(d['h4']['bear_ob'])} "
+        f"| 4H bear breaker (premium only): {fmt_breaker(d['h4']['bear_breaker'])}",
     ]
     if d["aligned"]:
         lines.append(f"\nAligned -> with-trend bias is {d['bias']} at {d['watch_fib']:.2f}. "
@@ -471,15 +639,15 @@ Daily structure: {d['daily']['top_label']} at {d['daily']['top']:.2f}, {d['daily
 4H zone: {d['h4']['zone']} ({d['h4']['pct']}% of range), range {d['h4']['bottom']:.2f}-{d['h4']['top']:.2f}
 4H structure: {d['h4']['top_label']} at {d['h4']['top']:.2f}, {d['h4']['bottom_label']} at {d['h4']['bottom']:.2f} (bias: {d['h4']['bias'] or 'unconfirmed'})
 
-4H LONG setup: fib .71 buy zone at {d['h4']['fib_long']:.2f}, bullish OB {fmt_ob(d['h4']['bull_ob'])}
-4H SHORT setup: fib .71 sell zone at {d['h4']['fib_short']:.2f}, bearish OB {fmt_ob(d['h4']['bear_ob'])}
+4H LONG setup: fib .71 buy zone at {d['h4']['fib_long']:.2f}, bullish OB {fmt_ob(d['h4']['bull_ob'])}, bull breaker (only valid if sitting in discount) {fmt_breaker(d['h4']['bull_breaker'])}
+4H SHORT setup: fib .71 sell zone at {d['h4']['fib_short']:.2f}, bearish OB {fmt_ob(d['h4']['bear_ob'])}, bear breaker (only valid if sitting in premium) {fmt_breaker(d['h4']['bear_breaker'])}
 
 Daily/4H alignment: {'YES — with-trend bias is ' + d['bias'] + ', counter-trend fade would be ' + str(d['counter_bias']) if d['aligned'] else 'NO — daily and 4H are in different zones right now'}
 
 Write a clear, structured plain-text brief (no markdown headers, no disclaimers) with these parts, each 1-3 lines:
 1. Daily and 4H state — zone, and which side is the Strong vs Weak swing on each
-2. LONG setup — the fib .71 buy price and OB confluence, and whether it's the with-trend or counter-trend trade right now
-3. SHORT setup — the fib .71 sell price and OB confluence, and whether it's the with-trend or counter-trend trade right now
+2. LONG setup — the fib .71 buy price, OB confluence, whether a valid bull breaker (discount-zone only) backs it up, and whether it's the with-trend or counter-trend trade right now
+3. SHORT setup — the fib .71 sell price, OB confluence, whether a valid bear breaker (premium-zone only) backs it up, and whether it's the with-trend or counter-trend trade right now
 4. Bottom line — which direction has HTF/LTF alignment behind it, and what the honest case for fading it would look like instead"""
 
     try:
@@ -561,7 +729,8 @@ def run_once(state, force=False):
         make_chart(daily_df, data["daily"], data["daily"]["bull_ob"], data["daily"]["bear_ob"],
                    f"{SYMBOL} Daily — {data['daily']['zone']}", daily_chart)
         make_chart(h4_df, data["h4"], data["h4"]["bull_ob"], data["h4"]["bear_ob"],
-                   f"{SYMBOL} 4H — {data['h4']['zone']}", h4_chart)
+                   f"{SYMBOL} 4H — {data['h4']['zone']}", h4_chart,
+                   bull_breaker=data["h4"]["bull_breaker"], bear_breaker=data["h4"]["bear_breaker"])
 
         send_telegram(text)
         send_telegram_photo(daily_chart, caption=f"{SYMBOL} Daily — {data['daily']['zone']}")
