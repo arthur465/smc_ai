@@ -30,6 +30,8 @@ Optional, unique to this script (no equivalent in the merged bot):
   BREAKER_Z_LEN           default 100  (z-score window for breaker impulse detection)
   BREAKER_Z_THRESHOLD     default 4.0  (z-score crossover level that flags an impulse)
   BREAKER_MAX_AGE         default 500  (bars before an unmitigated breaker/OB candidate expires)
+  BREAKER_ZONE_BAND       default 0.5  (which-half split for filtering breakers — see note
+                          below; deliberately NOT the same as PD_BAND)
   HEARTBEAT_HOURS         default 6    (post even with no change after this long)
   SMC_PD_STATE_FILE       default 'pd_zone_state.json'  (own file — separate
                           from SMC_STATE_DB, which is the other bot's sqlite
@@ -78,6 +80,7 @@ OB_LOOKBACK = int(os.getenv("OB_LOOKBACK", 150))
 BREAKER_Z_LEN = int(os.getenv("BREAKER_Z_LEN", 100))
 BREAKER_Z_THRESHOLD = float(os.getenv("BREAKER_Z_THRESHOLD", 4.0))
 BREAKER_MAX_AGE = int(os.getenv("BREAKER_MAX_AGE", 500))
+BREAKER_ZONE_BAND = float(os.getenv("BREAKER_ZONE_BAND", 0.5))
 POLL_SECONDS = int(os.getenv("SMC_POLL_SECONDS", 900))
 HEARTBEAT_HOURS = float(os.getenv("HEARTBEAT_HOURS", 6))
 STATE_FILE = os.getenv("SMC_PD_STATE_FILE", "pd_zone_state.json")
@@ -344,12 +347,20 @@ def find_order_blocks(df, lookback=150, left=5, right=5):
 # after BREAKER_MAX_AGE bars if never mitigated.
 #
 # Only 4H breakers get computed at all — per your call, no daily, no LTF.
-# On top of that, a breaker only counts if it's currently sitting in its
-# "appropriate" zone of the live 4H dealing range: bullish breaker in
-# Discount, bearish breaker in Premium. Anything else (a bear breaker
-# sitting in discount, a bull breaker in premium, either one stuck in
-# equilibrium) gets thrown out entirely — it's never returned, drawn, or
-# mentioned, exactly like an opposing breaker should be ignored.
+# On top of that, a breaker only counts if it's on the correct SIDE of the
+# live 4H dealing range: bullish breaker in the discount half, bearish
+# breaker in the premium half. Anything on the wrong side gets thrown out
+# entirely — it's never returned, drawn, or mentioned.
+#
+# Note this deliberately does NOT reuse PD_BAND (0.05), which only tags the
+# outer 5% edges of the range as Premium/Discount and calls the other 90%
+# Equilibrium. A breaker that forms right around the midpoint — technically
+# in "equilibrium" by that narrow definition — still leans to one side of
+# the 50% line, and that lean is what matters for a breaker: it still tags
+# discount or premium, just close to the border. So breaker filtering uses
+# its own BREAKER_ZONE_BAND (default 0.5 = a straight half-range split, no
+# equilibrium gap at all) instead of PD_BAND. The main Premium/Discount zone
+# label shown for daily/4H is untouched — it still uses the narrow PD_BAND.
 # ---------------------------------------------------------------------------
 def compute_breakers(df, z_len=100, z_threshold=4.0, max_age=500):
     """
@@ -445,11 +456,13 @@ def compute_breakers(df, z_len=100, z_threshold=4.0, max_age=500):
     return breaker_bull, breaker_bear
 
 
-def find_valid_breakers(df, top, bottom, z_len=100, z_threshold=4.0, max_age=500, band=PD_BAND):
+def find_valid_breakers(df, top, bottom, z_len=100, z_threshold=4.0, max_age=500, band=BREAKER_ZONE_BAND):
     """
-    Runs compute_breakers, then drops anything not sitting in its correct
-    zone of the given [bottom, top] range: bull breaker must classify as
-    Discount, bear breaker must classify as Premium. Everything else is
+    Runs compute_breakers, then drops anything on the wrong side of the
+    range: bull breaker must be in the discount half, bear breaker must be
+    in the premium half. This uses a plain which-half split (band=0.5 by
+    default), not the narrow PD_BAND edge-zone definition — see the comment
+    block above compute_breakers for why. Everything on the wrong side is
     discarded — never returned. Returns the single most recently formed
     valid bull breaker and bear breaker (or None each).
     """
