@@ -97,8 +97,31 @@ exchange = ccxt.okx({"enableRateLimit": True})
 # DATA
 # ---------------------------------------------------------------------------
 def fetch_ohlcv(symbol, timeframe, limit=500):
-    raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+    """
+    OKX (like most exchanges) silently caps a single fetch_ohlcv call to a
+    much smaller max than whatever `limit` you pass — usually somewhere
+    around 100-300 candles — so asking for 500 in one call was quietly only
+    getting back the exchange's per-call cap. That's what was capping the
+    4H chart/history at ~Jul 7 no matter what: the data itself never went
+    back further, so there was nothing for the window-extension logic to
+    extend into. This paginates backward with `since`, looping until it
+    actually has `limit` real bars (or the exchange runs out of history).
+    """
+    tf_ms = exchange.parse_timeframe(timeframe) * 1000
+    since = exchange.milliseconds() - limit * tf_ms
+    rows = []
+    while len(rows) < limit:
+        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=300)
+        if not batch:
+            break
+        rows.extend(batch)
+        next_since = batch[-1][0] + tf_ms
+        if next_since <= since or len(batch) < 2:
+            break  # exchange stopped advancing or ran out of history
+        since = next_since
+
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    df = df.drop_duplicates(subset="ts").sort_values("ts").tail(limit).reset_index(drop=True)
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
 
