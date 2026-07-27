@@ -53,6 +53,7 @@ import pandas as pd
 import requests
 import mplfinance as mpf
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 try:
     import anthropic
@@ -488,10 +489,27 @@ def make_chart(df, zone_range, bull_ob, bear_ob, title, path, bull_breaker=None,
     strong/weak swing labels on the top/bottom boundary, both 0.71 fib
     entry levels, any unmitigated order blocks (blue/orange), and — 4H
     only — a zone-filtered breaker block (teal = bullish support breaker
-    in discount, crimson = bearish resistance breaker in premium). Saved
-    to `path`.
+    in discount, crimson = bearish resistance breaker in premium).
+
+    If a breaker is passed, the plotted window automatically stretches back
+    far enough to include the actual bar it formed on (plus some left
+    padding), instead of always being clipped to CHART_BARS — a breaker
+    that's been active for weeks would otherwise get silently cropped off
+    the left edge, making it look newer (or invisible) than it really is.
+    The breaker is drawn as a rectangle starting at its true bar position,
+    not a full-width band, so you can actually see how long it's been there.
+    Saved to `path`.
     """
-    plot_df = df.tail(CHART_BARS).set_index("ts")[["open", "high", "low", "close", "volume"]]
+    n = len(df)
+    bars = CHART_BARS
+    for bx in (bull_breaker, bear_breaker):
+        if bx and "start" in bx:
+            padding = max(10, int(CHART_BARS * 0.1))
+            bars = max(bars, (n - bx["start"]) + padding)
+    bars = min(bars, n)
+    offset = n - bars  # index (in the full df) of the leftmost plotted bar
+
+    plot_df = df.tail(bars).set_index("ts")[["open", "high", "low", "close", "volume"]]
 
     top, bottom = zone_range["top"], zone_range["bottom"]
     eq_hi = 0.525 * top + 0.475 * bottom
@@ -539,18 +557,22 @@ def make_chart(df, zone_range, bull_ob, bear_ob, title, path, bull_breaker=None,
     if bear_ob:
         ax.axhspan(bear_ob["low"], bear_ob["high"], color="orange", alpha=0.15)
 
+    def draw_breaker(bx, color, label):
+        x0 = max(0, bx["start"] - offset)
+        width = max(x_right - x0, 1)
+        rect = Rectangle((x0, bx["bottom"]), width, bx["top"] - bx["bottom"],
+                          facecolor=color, alpha=0.28, edgecolor=color, linewidth=1.2, zorder=4)
+        ax.add_patch(rect)
+        mid = (bx["top"] + bx["bottom"]) / 2
+        since = bx.get("formed_time")
+        since_str = f", active since {since.strftime('%b %d')}" if since is not None else ""
+        ax.text(x_right, mid, f" {label}{since_str} — {bx['bottom']:.2f}-{bx['top']:.2f} ",
+                va="center", ha="right", fontsize=8, fontweight="bold", color=color, backgroundcolor="white")
+
     if bull_breaker:
-        ax.axhspan(bull_breaker["bottom"], bull_breaker["top"], facecolor="teal", alpha=0.28,
-                   edgecolor="teal", linewidth=1.2, zorder=4)
-        mid = (bull_breaker["top"] + bull_breaker["bottom"]) / 2
-        ax.text(x_right, mid, f" Bull Breaker (discount) {bull_breaker['bottom']:.2f}-{bull_breaker['top']:.2f} ",
-                va="center", ha="right", fontsize=8, fontweight="bold", color="teal", backgroundcolor="white")
+        draw_breaker(bull_breaker, "teal", "Bull Breaker (discount)")
     if bear_breaker:
-        ax.axhspan(bear_breaker["bottom"], bear_breaker["top"], facecolor="crimson", alpha=0.22,
-                   edgecolor="crimson", linewidth=1.2, zorder=4)
-        mid = (bear_breaker["top"] + bear_breaker["bottom"]) / 2
-        ax.text(x_right, mid, f" Bear Breaker (premium) {bear_breaker['bottom']:.2f}-{bear_breaker['top']:.2f} ",
-                va="center", ha="right", fontsize=8, fontweight="bold", color="crimson", backgroundcolor="white")
+        draw_breaker(bear_breaker, "crimson", "Bear Breaker (premium)")
 
     fig.savefig(path, dpi=130, bbox_inches="tight")
     plt.close(fig)
