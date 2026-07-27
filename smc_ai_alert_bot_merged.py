@@ -27,8 +27,8 @@ Optional, unique to this script (no equivalent in the merged bot):
   PD_BAND                 default 0.05 (premium/discount edge fraction, matches
                           the merged bot's cfg.premium_discount_band default)
   OB_LOOKBACK             default 150  (bars scanned for order blocks)
-  BREAKER_Z_LEN           default 100  (z-score window for breaker impulse detection)
-  BREAKER_Z_THRESHOLD     default 4.0  (z-score crossover level that flags an impulse)
+  BREAKER_OB_LEFT         default 5    (fractal lookback each side for breaker-source OBs)
+  BREAKER_OB_RIGHT        default 5
   BREAKER_MAX_AGE         default 500  (bars before an unmitigated breaker/OB candidate expires)
   BREAKER_ZONE_BAND       default 0.5  (which-half split for filtering breakers — see note
                           below; deliberately NOT the same as PD_BAND)
@@ -78,8 +78,8 @@ SWING_LENGTH_4H = int(os.getenv("SWING_LENGTH_4H", 50))
 PD_BAND = float(os.getenv("PD_BAND", 0.05))
 
 OB_LOOKBACK = int(os.getenv("OB_LOOKBACK", 150))
-BREAKER_Z_LEN = int(os.getenv("BREAKER_Z_LEN", 100))
-BREAKER_Z_THRESHOLD = float(os.getenv("BREAKER_Z_THRESHOLD", 4.0))
+BREAKER_OB_LEFT = int(os.getenv("BREAKER_OB_LEFT", 5))
+BREAKER_OB_RIGHT = int(os.getenv("BREAKER_OB_RIGHT", 5))
 BREAKER_MAX_AGE = int(os.getenv("BREAKER_MAX_AGE", 500))
 BREAKER_ZONE_BAND = float(os.getenv("BREAKER_ZONE_BAND", 0.5))
 POLL_SECONDS = int(os.getenv("SMC_POLL_SECONDS", 900))
@@ -359,16 +359,23 @@ def find_order_blocks(df, lookback=150, left=5, right=5):
 
 
 # ---------------------------------------------------------------------------
-# BREAKER BLOCKS (port of AlgoAlpha's "Breaker Blocks Signals", 4H only)
+# BREAKER BLOCKS (sourced from your own LuxAlgo-style order blocks, 4H only)
 #
-# Cumulative same-direction move distance (updist/downdist) gets z-scored
-# against a rolling window; a z-score crossing above the threshold flags an
-# impulsive move. That creates an order-block candidate box from the last
-# opposite-colored candle before the impulse. If price later closes back
-# through that candidate for two consecutive bars, the OB failed and flips
-# polarity into a "breaker" block (a failed bullish OB becomes bearish
-# resistance; a failed bearish OB becomes bullish support). Boxes expire
-# after BREAKER_MAX_AGE bars if never mitigated.
+# Instead of AlgoAlpha's z-score impulse engine, this flips the same OB
+# candidates find_order_blocks() finds — an unmitigated OB whose price gets
+# broken through doesn't just disappear, it flips polarity into a breaker:
+# a bullish OB (support) that fails becomes a bearish breaker (resistance);
+# a bearish OB (resistance) that fails becomes a bullish breaker (support).
+# Concretely: a bullish OB sitting in 4H premium gets broken down through,
+# flips into a bear breaker, and price continues down into discount — that
+# bear breaker is exactly the kind of thing this is meant to catch.
+#
+# This tracks every OB the fractal-break logic finds over the full fetched
+# history (not just the single most recent one find_order_blocks returns),
+# watches each forward for the bar where price closes back through it, and
+# flips it into a breaker at that bar. Breakers themselves expire after
+# BREAKER_MAX_AGE bars, or get invalidated if price later breaks back
+# through them too.
 #
 # Only 4H breakers get computed at all — per your call, no daily, no LTF.
 # On top of that, a breaker only counts if it's on the correct SIDE of the
@@ -376,7 +383,7 @@ def find_order_blocks(df, lookback=150, left=5, right=5):
 # breaker in the premium half. Anything on the wrong side gets thrown out
 # entirely — it's never returned, drawn, or mentioned.
 #
-# Note this deliberately does NOT reuse PD_BAND (0.05), which only tags the
+# This deliberately does NOT reuse PD_BAND (0.05), which only tags the
 # outer 5% edges of the range as Premium/Discount and calls the other 90%
 # Equilibrium. A breaker that forms right around the midpoint — technically
 # in "equilibrium" by that narrow definition — still leans to one side of
@@ -386,7 +393,7 @@ def find_order_blocks(df, lookback=150, left=5, right=5):
 # equilibrium gap at all) instead of PD_BAND. The main Premium/Discount zone
 # label shown for daily/4H is untouched — it still uses the narrow PD_BAND.
 # ---------------------------------------------------------------------------
-def compute_breakers(df, z_len=100, z_threshold=4.0, max_age=500):
+def compute_ob_breakers(df, left=5, right=5, max_age=500):
     """
     Returns (bull_breakers, bear_breakers): lists of currently active
     (unmitigated, unexpired) breaker boxes as of the last bar, each
@@ -396,22 +403,7 @@ def compute_breakers(df, z_len=100, z_threshold=4.0, max_age=500):
     o, h, l, c = df["open"].values, df["high"].values, df["low"].values, df["close"].values
     ts = df["ts"].values
     n = len(df)
-
-    updist = np.zeros(n)
-    downdist = np.zeros(n)
-    for i in range(n):
-        prev_up = updist[i - 1] if i > 0 else 0.0
-        prev_dn = downdist[i - 1] if i > 0 else 0.0
-        updist[i] = prev_up + (c[i] - o[i]) if c[i] > o[i] else 0.0
-        downdist[i] = prev_dn + (o[i] - c[i]) if c[i] < o[i] else 0.0
-
-    up_mean = pd.Series(updist).rolling(z_len).mean().values
-    up_std = pd.Series(updist).rolling(z_len).std(ddof=0).values
-    dn_mean = pd.Series(downdist).rolling(z_len).mean().values
-    dn_std = pd.Series(downdist).rolling(z_len).std(ddof=0).values
-
-    z_up = np.where((up_std > 0) & ~np.isnan(up_std), (updist - up_mean) / np.where(up_std == 0, np.nan, up_std), np.nan)
-    z_dn = np.where((dn_std > 0) & ~np.isnan(dn_std), (downdist - dn_mean) / np.where(dn_std == 0, np.nan, dn_std), np.nan)
+    highs, lows = find_fractals(df, left, right)
 
     def overlaps(top_new, bottom_new, *box_lists):
         for boxes in box_lists:
@@ -420,59 +412,69 @@ def compute_breakers(df, z_len=100, z_threshold=4.0, max_age=500):
                     return True
         return False
 
-    last_down_idx, last_up_idx = None, None
-    bull_cand, bear_cand = [], []   # OB candidates awaiting mitigation
-    breaker_bull, breaker_bear = [], []  # confirmed, still-active breakers
+    # Every historical OB candidate, same detection rule as find_order_blocks:
+    # a break of a fractal swing level, sourced from the last opposite-colored
+    # candle before the break. Tracked here for every break in the series
+    # (not just the latest), so each one's eventual mitigation can be caught.
+    bull_obs, bear_obs = [], []  # support / resistance candidates, each {'top','bottom','formed'}
+
+    for idx, level in lows:
+        broken_at = next((j for j in range(idx + 1, n) if c[j] < level), None)
+        if broken_at is None:
+            continue
+        for k in range(broken_at - 1, idx - 1, -1):
+            if c[k] > o[k]:  # last green candle before the down-break -> resistance (bearish OB)
+                bear_obs.append({"top": float(h[k]), "bottom": float(l[k]), "formed": broken_at})
+                break
+
+    for idx, level in highs:
+        broken_at = next((j for j in range(idx + 1, n) if c[j] > level), None)
+        if broken_at is None:
+            continue
+        for k in range(broken_at - 1, idx - 1, -1):
+            if c[k] < o[k]:  # last red candle before the up-break -> support (bullish OB)
+                bull_obs.append({"top": float(h[k]), "bottom": float(l[k]), "formed": broken_at})
+                break
+
+    bull_obs.sort(key=lambda x: x["formed"])
+    bear_obs.sort(key=lambda x: x["formed"])
+
+    active_bull_obs, active_bear_obs = [], []
+    breaker_bull, breaker_bear = [], []
+    bi, ei = 0, 0
 
     for i in range(n):
-        if c[i] < o[i]:
-            last_down_idx = i
-        if c[i] > o[i]:
-            last_up_idx = i
-
-        prev_z_up = z_up[i - 1] if i > 0 else np.nan
-        prev_z_dn = z_dn[i - 1] if i > 0 else np.nan
-        bullish_signal = (not np.isnan(z_up[i]) and not np.isnan(prev_z_up)
-                          and prev_z_up <= z_threshold and z_up[i] > z_threshold and prev_z_up != 0)
-        bearish_signal = (not np.isnan(z_dn[i]) and not np.isnan(prev_z_dn)
-                          and prev_z_dn <= z_threshold and z_dn[i] > z_threshold and prev_z_dn != 0)
-
-        if bullish_signal and last_down_idx is not None:
-            t, b = float(h[last_down_idx]), float(l[last_down_idx])
-            if not overlaps(t, b, bull_cand, bear_cand, breaker_bull, breaker_bear):
-                bull_cand.append({"top": t, "bottom": b, "start": last_down_idx})
-
-        if bearish_signal and last_up_idx is not None:
-            t, b = float(h[last_up_idx]), float(l[last_up_idx])
-            if not overlaps(t, b, bull_cand, bear_cand, breaker_bull, breaker_bear):
-                bear_cand.append({"top": t, "bottom": b, "start": last_up_idx})
+        while bi < len(bull_obs) and bull_obs[bi]["formed"] == i:
+            bx = bull_obs[bi]
+            if not overlaps(bx["top"], bx["bottom"], active_bull_obs, active_bear_obs, breaker_bull, breaker_bear):
+                active_bull_obs.append(dict(bx))
+            bi += 1
+        while ei < len(bear_obs) and bear_obs[ei]["formed"] == i:
+            bx = bear_obs[ei]
+            if not overlaps(bx["top"], bx["bottom"], active_bull_obs, active_bear_obs, breaker_bull, breaker_bear):
+                active_bear_obs.append(dict(bx))
+            ei += 1
 
         still = []
-        for bx in bull_cand:
-            mitigated = i >= 1 and c[i] < bx["bottom"] and c[i - 1] < bx["bottom"]
-            expired = (i - bx["start"]) >= max_age
-            if mitigated and not overlaps(bx["top"], bx["bottom"], breaker_bull, breaker_bear):
-                breaker_bear.append({"top": bx["top"], "bottom": bx["bottom"], "start": i, "formed_time": ts[i]})
-            if not (mitigated or expired):
+        for bx in active_bull_obs:
+            if c[i] < bx["bottom"]:  # support failed -> flips into a bearish breaker
+                if not overlaps(bx["top"], bx["bottom"], breaker_bull, breaker_bear):
+                    breaker_bear.append({"top": bx["top"], "bottom": bx["bottom"], "start": i, "formed_time": ts[i]})
+            else:
                 still.append(bx)
-        bull_cand = still
+        active_bull_obs = still
 
         still = []
-        for bx in bear_cand:
-            mitigated = i >= 1 and c[i] > bx["top"] and c[i - 1] > bx["top"]
-            expired = (i - bx["start"]) >= max_age
-            if mitigated and not overlaps(bx["top"], bx["bottom"], breaker_bull, breaker_bear):
-                breaker_bull.append({"top": bx["top"], "bottom": bx["bottom"], "start": i, "formed_time": ts[i]})
-            if not (mitigated or expired):
+        for bx in active_bear_obs:
+            if c[i] > bx["top"]:  # resistance failed -> flips into a bullish breaker
+                if not overlaps(bx["top"], bx["bottom"], breaker_bull, breaker_bear):
+                    breaker_bull.append({"top": bx["top"], "bottom": bx["bottom"], "start": i, "formed_time": ts[i]})
+            else:
                 still.append(bx)
-        bear_cand = still
+        active_bear_obs = still
 
-        breaker_bull = [bx for bx in breaker_bull
-                         if not (i >= 1 and c[i] < bx["bottom"] and c[i - 1] < bx["bottom"])
-                         and (i - bx["start"]) < max_age]
-        breaker_bear = [bx for bx in breaker_bear
-                         if not (i >= 1 and c[i] > bx["top"] and c[i - 1] > bx["top"])
-                         and (i - bx["start"]) < max_age]
+        breaker_bull = [bx for bx in breaker_bull if not (c[i] < bx["bottom"]) and (i - bx["start"]) < max_age]
+        breaker_bear = [bx for bx in breaker_bear if not (c[i] > bx["top"]) and (i - bx["start"]) < max_age]
 
     for bx in breaker_bull + breaker_bear:
         bx["formed_time"] = pd.Timestamp(bx["formed_time"])
@@ -480,17 +482,17 @@ def compute_breakers(df, z_len=100, z_threshold=4.0, max_age=500):
     return breaker_bull, breaker_bear
 
 
-def find_valid_breakers(df, top, bottom, z_len=100, z_threshold=4.0, max_age=500, band=BREAKER_ZONE_BAND):
+def find_valid_breakers(df, top, bottom, left=5, right=5, max_age=500, band=BREAKER_ZONE_BAND):
     """
-    Runs compute_breakers, then drops anything on the wrong side of the
+    Runs compute_ob_breakers, then drops anything on the wrong side of the
     range: bull breaker must be in the discount half, bear breaker must be
     in the premium half. This uses a plain which-half split (band=0.5 by
     default), not the narrow PD_BAND edge-zone definition — see the comment
-    block above compute_breakers for why. Everything on the wrong side is
+    block above compute_ob_breakers for why. Everything on the wrong side is
     discarded — never returned. Returns the single most recently formed
     valid bull breaker and bear breaker (or None each).
     """
-    bull_breakers, bear_breakers = compute_breakers(df, z_len, z_threshold, max_age)
+    bull_breakers, bear_breakers = compute_ob_breakers(df, left, right, max_age)
 
     valid_bull = [bx for bx in bull_breakers
                   if classify_zone((bx["top"] + bx["bottom"]) / 2, top, bottom, band)[0] == "Discount"]
@@ -623,7 +625,7 @@ def analyze():
     # 4H only, per your call — daily/LTF breakers aren't computed at all.
     h_bull_breaker, h_bear_breaker = find_valid_breakers(
         h4, h_range["top"], h_range["bottom"],
-        BREAKER_Z_LEN, BREAKER_Z_THRESHOLD, BREAKER_MAX_AGE,
+        BREAKER_OB_LEFT, BREAKER_OB_RIGHT, BREAKER_MAX_AGE,
     )
 
     aligned = d_zone in ("Premium", "Discount") and d_zone == h_zone
